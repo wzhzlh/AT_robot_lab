@@ -29,8 +29,8 @@ class HIMActorCritic(nn.Module):
         estimator_max_grad_norm: float = 10.0,
         estimator_num_prototypes: int = 32,
         estimator_temperature: float = 3.0,
-        estimator_vel_slice: tuple[int, int] = (45, 48),
-        estimator_target_slice: tuple[int, int] = (3, 48),
+        estimator_vel_slice: tuple[int, int] | None = None,
+        estimator_target_slice: tuple[int, int] | None = None,
         **_: object,
     ):
         super().__init__()
@@ -44,8 +44,19 @@ class HIMActorCritic(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_actions = num_actions
         self.num_one_step_obs = num_one_step_obs
+        if estimator_vel_slice is None or estimator_target_slice is None:
+            raise ValueError(
+                "HIMActorCritic requires runner-injected estimator_vel_slice and "
+                "estimator_target_slice derived from the live observation layout."
+            )
         self.vel_slice = tuple(estimator_vel_slice)
         self.target_slice = tuple(estimator_target_slice)
+        for name, obs_slice, upper in (
+            ("estimator_vel_slice", self.vel_slice, num_critic_obs),
+            ("estimator_target_slice", self.target_slice, num_critic_obs),
+        ):
+            if len(obs_slice) != 2 or not (0 <= obs_slice[0] < obs_slice[1] <= upper):
+                raise ValueError(f"Invalid {name}={obs_slice} for critic observation dim {upper}.")
         self.num_velocity_features = self.vel_slice[1] - self.vel_slice[0]
         self.num_latent = int(estimator_encoder_hidden_dims[-1])
 

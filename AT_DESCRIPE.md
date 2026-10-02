@@ -58,10 +58,11 @@ docker/container.sh enter
 ```bash
 cd /workspace/isaaclab_extension_template
 /workspace/isaaclab/isaaclab.sh -p /workspace/isaaclab_extension_template/scripts/reinforcement_learning/rsl_rl/train.py \
-  --task=RobotLab-Isaac-Velocity-Flat-ATDog-Dog-v0 \
-  --num_envs=8000 \
-  --max_iterations=1000\
-  --headless 
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-Dog2-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --num_envs=6500 \
+  --max_iterations=1000 \
+  --headless
 
 cd /workspace/isaaclab_extension_template
 /workspace/isaaclab/isaaclab.sh -p /workspace/isaaclab_extension_template/scripts/reinforcement_learning/rsl_rl/train.py \
@@ -117,11 +118,8 @@ cd /workspace/isaaclab_extension_template
 cd /workspace/isaaclab_extension_template
 
 
-/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
-  --task=RobotLab-Isaac-Velocity-Stairs-ATDog-Dog3-v0 \
-  --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog3_stairs/2026-06-12_08-35-01/model_38986.pt \
-  --num_envs=1\
-  --headless
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py   --task=RobotLab-Isaac-Velocity-Slope-ATDog-Dog2-v0   --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog2_slope_him/2026-09-28_08-38-05/model_11000.pt     --num_envs=10  --agent=rsl_rl_him_cfg_entry_point 
+
 
 /workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
   --task=RobotLab-Isaac-Velocity-Rough-ATDog-Dog2-Arm-v0 \
@@ -143,11 +141,10 @@ cd /workspace/isaaclab_extension_template
   --num_envs=10
 
 /workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
-  --task=RobotLab-Isaac-Velocity-Slope-ATDog-Dog3-v0 \
-  --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog3_slope/2026-06-14_01-54-17/model_13399.pt \
-  --num_envs=1\
-  --headless
-
+  --task=RobotLab-Isaac-Velocity-Slope-ATDog-Dog2-v0 \
+  --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog2_slope_him/2026-09-12_11-58-40/model_15900.pt \
+  --num_envs=10\
+  --agent=rsl_rl_him_cfg_entry_point 
 ```
 
 ## 复制导出的模型到宿主机

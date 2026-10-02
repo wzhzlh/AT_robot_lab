@@ -8,7 +8,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     class_name = "HIMActorCritic"
-    num_one_step_obs = None
+    num_one_step_obs = 45
     history_length = 6
     estimator_encoder_hidden_dims = [128, 64, 16]
     estimator_target_hidden_dims = [128, 64]
@@ -16,8 +16,9 @@ class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     estimator_max_grad_norm = 10.0
     estimator_num_prototypes = 32
     estimator_temperature = 3.0
-    estimator_vel_slice = None
-    estimator_target_slice = None
+    # Dog2 critic layout: base_lin_vel(0:3) followed by the 45-D policy frame.
+    estimator_vel_slice = (0, 3)
+    estimator_target_slice = (3, 48)
 
 
 @configclass

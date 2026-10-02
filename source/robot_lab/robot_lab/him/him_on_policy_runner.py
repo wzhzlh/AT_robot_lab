@@ -27,7 +27,12 @@ class HIMOnPolicyRunner:
         self.max_iterations = int(train_cfg.get("max_iterations", 0))
 
         self.policy_cfg.pop("num_one_step_obs", None)
-        num_critic_obs = self.env.num_privileged_obs if self.env.num_privileged_obs is not None else self.env.num_obs
+        if self.env.num_privileged_obs is None:
+            raise ValueError(
+                "HIM requires a dedicated critic observation group; "
+                "actor observations cannot be used as a silent fallback."
+            )
+        num_critic_obs = self.env.num_privileged_obs
         self._resolve_estimator_slices(num_critic_obs)
         actor_critic = HIMActorCritic(
             self.env.num_obs,

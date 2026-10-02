@@ -10,7 +10,13 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 
 class HIMVecEnvWrapper:
-    def __init__(self, env, clip_actions: float, num_one_step_obs: int | None = None):
+    def __init__(
+        self,
+        env,
+        clip_actions: float,
+        num_one_step_obs: int | None = None,
+        reorder_history: bool = True,
+    ):
         self._raw_env = env
         self._wrapped_env = RslRlVecEnvWrapper(env, clip_actions=clip_actions)
 
@@ -18,6 +24,9 @@ class HIMVecEnvWrapper:
         self.num_actions = int(self._wrapped_env.num_actions)
         self.device = self._wrapped_env.device
         self.max_episode_length = self._wrapped_env.max_episode_length
+        # Isaac Lab flattens each term's history independently; HIM expects full
+        # observation frames concatenated from newest to oldest.
+        self.reorder_history = bool(reorder_history)
 
         self.policy_term_slices, self.policy_one_step_term_slices = self._build_group_layout("policy")
         self.critic_term_slices, _ = self._build_group_layout("critic")
@@ -51,6 +60,33 @@ class HIMVecEnvWrapper:
         self._cache_observations(actor_obs, critic_obs)
         self.num_obs = int(actor_obs.shape[-1])
         self.num_privileged_obs = None if critic_obs is None else int(critic_obs.shape[-1])
+
+        print(
+            "[INFO] HIM observation manager dimensions: "
+            f"policy_terms={self._term_dim_report('policy')}, "
+            f"critic_terms={self._term_dim_report('critic')}; "
+            f"policy_total={self.num_obs}, critic_total={self.num_privileged_obs}, "
+            f"policy_one_step={self.num_one_step_obs}"
+        )
+
+        # HIMLocomotion's Dog2 contract: no heading in velocity_commands,
+        # 45-dimensional actor one-step input and 48-dimensional critic input.
+        command_slice = self.policy_one_step_term_slices.get("velocity_commands")
+        if command_slice is None or command_slice.stop - command_slice.start != 3:
+            raise ValueError(
+                "HIM Dog2 requires velocity_commands to be exactly 3-D (vx, vy, yaw), "
+                "without heading."
+            )
+        if self.num_one_step_obs != 45:
+            raise ValueError(
+                f"HIM Dog2 actor one-step observation must be 45-D, got {self.num_one_step_obs}."
+            )
+        if self.num_privileged_obs != 48:
+            raise ValueError(
+                f"HIM Dog2 critic observation must be 48-D, got {self.num_privileged_obs}."
+            )
+        if "actions" not in self.policy_one_step_term_slices:
+            raise ValueError("HIM policy observation history must include the actions term.")
 
         if self.num_obs % self.num_one_step_obs != 0:
             raise ValueError(
@@ -96,8 +132,18 @@ class HIMVecEnvWrapper:
     def get_critic_observations(self) -> torch.Tensor:
         critic_obs = self.get_privileged_observations()
         if critic_obs is None:
-            return self.get_observations()
+            raise RuntimeError(
+                "HIM requires a dedicated 'critic' observation group; "
+                "refusing to fall back to actor observations."
+            )
         return critic_obs
+
+    def _term_dim_report(self, group_name: str) -> list[dict[str, object]]:
+        layout = self.policy_one_step_term_slices if group_name == "policy" else self.critic_term_slices
+        return [
+            {"name": name, "start": sl.start, "stop": sl.stop, "dim": sl.stop - sl.start}
+            for name, sl in layout.items()
+        ]
 
     def get_him_deployment_metadata(self) -> dict[str, object]:
         one_step_obs_dim = self.num_one_step_obs
@@ -119,6 +165,7 @@ class HIMVecEnvWrapper:
                 }
                 for term_name, term_slice in self.policy_one_step_term_slices.items()
             ],
+            "critic_terms": self._term_dim_report("critic"),
             "critic_term_names": list(self.critic_term_names),
             "default_estimator_vel_slice": self.default_estimator_vel_slice,
             "default_estimator_target_slice": self.default_estimator_target_slice,
@@ -132,11 +179,14 @@ class HIMVecEnvWrapper:
         actor_obs = self._extract_group_observations(observations, "policy")
         if actor_obs is None:
             raise KeyError("HIM requires a 'policy' observation group.")
-        actor_obs = self._reorder_policy_history(actor_obs)
+        if self.reorder_history:
+            actor_obs = self._reorder_policy_history(actor_obs)
 
         critic_obs = self._extract_group_observations(observations, "critic")
         if critic_obs is None:
             critic_obs = self._compute_group("critic")
+        if critic_obs is None:
+            raise KeyError("HIM requires a dedicated 'critic' observation group.")
         return actor_obs, critic_obs
 
     def _reorder_policy_history(self, actor_obs: torch.Tensor) -> torch.Tensor:
@@ -262,7 +312,13 @@ class HIMVecEnvWrapper:
         if not self.policy_term_slices or not self.critic_term_slices:
             return None
 
-        shared_names = [name for name in self.policy_term_slices if name in self.critic_term_slices]
+        # HIM target is exactly policy terms shared with critic, excluding the
+        # privileged estimator target (base_lin_vel). Do not include future
+        # shared terms implicitly unless they are part of the policy input.
+        shared_names = [
+            name for name in self.policy_term_slices
+            if name != "base_lin_vel" and name in self.critic_term_slices
+        ]
         if not shared_names:
             return None
 

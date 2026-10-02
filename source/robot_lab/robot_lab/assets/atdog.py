@@ -44,17 +44,25 @@ AT_DOG2_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
     soft_joint_pos_limit_factor=0.9,
+    # 12 个驱动电机：FL=左前，FR=右前，RL=左后，RR=右后。
+    # friction=a（库仑摩擦），damping=b（黏性摩擦）；以下 a/b 为示例值。
     actuators={
-        "legs": DelayedPDActuatorCfg(
-            joint_names_expr=[".*"],
-            effort_limit=23.5,
-            velocity_limit=30.0,
-            stiffness=25.0,
-            damping=0.5,
-            friction=0.5,
-            min_delay=1,  # physics steps (sim.dt=0.005s): 1 * 5ms = 5ms
-            max_delay=2,  # physics steps (fixed delay): 1 * 5ms = 5ms
-        ),
+        # 左前腿 Front-Left
+        "FL_hip": DelayedPDActuatorCfg(joint_names_expr=["FL_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "FL_thigh": DelayedPDActuatorCfg(joint_names_expr=["FL_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "FL_calf": DelayedPDActuatorCfg(joint_names_expr=["FL_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        # 右前腿 Front-Right
+        "FR_hip": DelayedPDActuatorCfg(joint_names_expr=["FR_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "FR_thigh": DelayedPDActuatorCfg(joint_names_expr=["FR_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "FR_calf": DelayedPDActuatorCfg(joint_names_expr=["FR_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        # 左后腿 Rear-Left
+        "RL_hip": DelayedPDActuatorCfg(joint_names_expr=["RL_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "RL_thigh": DelayedPDActuatorCfg(joint_names_expr=["RL_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "RL_calf": DelayedPDActuatorCfg(joint_names_expr=["RL_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        # 右后腿 Rear-Right
+        "RR_hip": DelayedPDActuatorCfg(joint_names_expr=["RR_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "RR_thigh": DelayedPDActuatorCfg(joint_names_expr=["RR_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
+        "RR_calf": DelayedPDActuatorCfg(joint_names_expr=["RR_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.5, min_delay=1, max_delay=2),
     },
 )
 """Configuration of atdog dog using delayed PD actuators."""

@@ -221,13 +221,13 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -2.0
+        self.rewards.action_rate_l2.weight = -15.0
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
         self.rewards.action_smoothness_2_l2.weight = -0.6
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
-        self.rewards.undesired_contacts.weight = -200.0
+        self.rewards.undesired_contacts.weight = -100.0
         self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{self.foot_link_name}).*"]
         # 足端接触力惩罚，避免落脚冲击过大。
         # 过大可能导致“轻触地”倾向，影响抓地与推进效率。
@@ -237,9 +237,9 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 55.0
+        self.rewards.track_lin_vel_xy_exp.weight = 50.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 30.0
+        self.rewards.track_ang_vel_z_exp.weight = 55.0
 
         # Others
         # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。
@@ -279,7 +279,7 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.diagonal_trot_contact_pattern.weight = -1.0
         self.rewards.diagonal_trot_contact_pattern.params["foot_names"] = ("FL_calf", "FR_calf", "RL_calf", "RR_calf")
         # 机身“向上”姿态奖励（保持重力反方向对齐），提升整体直立稳定性。
-        self.rewards.upward.weight = 0.0
+        self.rewards.upward.weight = 25.0
 
         self.rewards.feet_distance_y_exp.weight = 2.0
         self.rewards.feet_distance_y_exp.params["stance_width"] = 0.16

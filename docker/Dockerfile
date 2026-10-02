@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.4
-
 ARG ISAACLAB_BASE_IMAGE_ARG
 ARG BUILD_HTTP_PROXY_ARG
 ARG BUILD_HTTPS_PROXY_ARG
@@ -39,11 +37,13 @@ ENV CLASH_NO_PROXY_ARG=${CLASH_NO_PROXY_ARG}
 USER root
 
 # Copy the Isaac Lab Extension Template directory (files to exclude are defined in .dockerignore)
-COPY ../ ${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}
+COPY ./ ${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}
 
 # Ensure the Isaac Lab core packages are installed into the Python environment used by Isaac Sim.
 # Some custom/base images only provide aliases to Isaac Sim's python and do not pre-install the
 # editable Isaac Lab packages, which causes `ModuleNotFoundError: No module named 'isaaclab'`.
+# flatdict 4.0.1 uses pkg_resources while building, which setuptools 82 removed.
+# Preinstall it without build isolation so Isaac Lab's dependency install can reuse it.
 RUN bash -i -c 'source "${HOME}/.bashrc" && \
     if [[ -n "${BUILD_HTTP_PROXY_ARG}" || -n "${BUILD_HTTPS_PROXY_ARG}" || -n "${BUILD_ALL_PROXY_ARG}" ]]; then \
         export HTTP_PROXY="${BUILD_HTTP_PROXY_ARG}" && \
@@ -68,7 +68,10 @@ RUN bash -i -c 'source "${HOME}/.bashrc" && \
         unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; \
     fi && \
     export ISAACLAB_PATH=${ISAACLAB_PATH:-/workspace/isaaclab} && \
-    ${ISAACLAB_PATH}/isaaclab.sh --install'
+    ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install "setuptools<82" && \
+    ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install --no-build-isolation "flatdict==4.0.1" && \
+    ${ISAACLAB_PATH}/isaaclab.sh --install && \
+    ${ISAACLAB_PATH}/isaaclab.sh -p -c "import flatdict; import isaaclab"'
 
 # Install the robot_lab extension into the same Python environment.
 RUN bash -i -c 'source "${HOME}/.bashrc" && \
@@ -94,8 +97,9 @@ RUN bash -i -c 'source "${HOME}/.bashrc" && \
     else \
         unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; \
     fi && \
+    export ISAACLAB_PATH=${ISAACLAB_PATH:-/workspace/isaaclab} && \
     cd ${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}/source/robot_lab && \
-    pip install -e .'
+    ${ISAACLAB_PATH}/isaaclab.sh -p -m pip install -e .'
 
 # make working directory as the Isaac Lab directory
 # this is the default directory when the container is run
