@@ -1476,3 +1476,97 @@ Isaac Lab原始270
         ↓
       12维
      action
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    ┌──────────────────────────────┐
+                    │        Isaac Sim / PhysX     │
+                    │   机器人 + 地形 + 接触 + 动力学 │
+                    └──────────────┬───────────────┘
+                                   │
+                                   │ 产生机器人状态
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │       Isaac Lab Environment   │
+                    │    ManagerBasedRLEnv          │
+                    │                              │
+                    │ Scene                         │
+                    │ Commands                      │
+                    │ Observations                  │
+                    │ Actions                      │
+                    │ Rewards                      │
+                    │ Events / Randomization       │
+                    │ Terminations                 │
+                    │ Curriculum                   │
+                    └──────────────┬───────────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────────┐
+                    │      RslRlVecEnvWrapper       │
+                    │          ↓                     │
+                    │       HIMVecEnvWrapper        │
+                    │                              │
+                    │ policy obs  →  历史重排        │
+                    │ critic obs  →  privileged obs │
+                    └──────────────┬───────────────┘
+                                   │
+                     ┌─────────────┴─────────────┐
+                     ▼                           ▼
+              Policy History                 Critic Obs
+                 270                        48
+                     │                           │
+                     │                           ▼
+                     │                       Critic
+                     │                       48 → 1
+                     │
+                     ▼
+                HIM Estimator
+                  270
+                   │
+            ┌──────┴──────┐
+            ▼             ▼
+       velocity 3      latent 16
+            │             │
+            └──────┬──────┘
+                   ▼
+        当前帧 obs 45 + 3 + 16
+                   │
+                   ▼
+                 64
+                   │
+                   ▼
+                Actor
+                 64
+                   │
+                   ▼
+                 12
+                actions
+                   │
+                   ▼
+        JointPositionAction
+                   │
+            scale + offset
+                   │
+                   ▼
+           joint position target
+                   │
+                   ▼
+          Delayed PD Actuator
+                   │
+                   ▼
+             12 个关节
+                   │
+                   ▼
+                机器人

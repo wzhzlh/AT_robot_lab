@@ -64,6 +64,7 @@ class HIMOnPolicyRunner:
         self.latest_episode_metrics: dict[str, float] = {}
         self.latest_mean_reward: float | None = None
         self.latest_mean_episode_length: float | None = None
+        self.episode_metric_history: deque[dict[str, torch.Tensor | float | int]] = deque(maxlen=100)
 
         _, reset_infos = self.env.reset()
         self._update_episode_metric_cache(self._extract_log_dict(reset_infos))
@@ -203,7 +204,8 @@ class HIMOnPolicyRunner:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
         if init_at_random_ep_len and hasattr(self.env, "episode_length_buf") and hasattr(self.env, "max_episode_length"):
-            self.env.episode_length_buf = torch.randint_like(
+            env_unwrapped = getattr(self.env, "unwrapped", self.env)
+            env_unwrapped.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
@@ -220,6 +222,7 @@ class HIMOnPolicyRunner:
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for iteration in range(self.current_learning_iteration, tot_iter):
             start = time.time()
+            episodes_completed = 0
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
@@ -234,6 +237,7 @@ class HIMOnPolicyRunner:
                     cur_episode_length += 1
                     done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
                     if done_ids.numel() > 0:
+                        episodes_completed += done_ids.numel()
                         rewbuffer.extend(cur_reward_sum[done_ids].detach().cpu().tolist())
                         lenbuffer.extend(cur_episode_length[done_ids].detach().cpu().tolist())
                         self._append_episode_log(ep_infos, infos)
@@ -266,6 +270,7 @@ class HIMOnPolicyRunner:
                 rewbuffer,
                 lenbuffer,
                 ep_infos,
+                episodes_completed,
                 float(cur_reward_sum.mean().item()),
                 float(cur_episode_length.mean().item()),
             )
@@ -292,6 +297,7 @@ class HIMOnPolicyRunner:
         rewbuffer: deque,
         lenbuffer: deque,
         ep_infos: list[dict[str, torch.Tensor | float | int]],
+        episodes_completed: int,
         partial_mean_reward: float,
         partial_mean_episode_length: float,
     ):
@@ -302,7 +308,8 @@ class HIMOnPolicyRunner:
         mean_reward = statistics.mean(rewbuffer) if rewbuffer else None
         mean_episode_length = statistics.mean(lenbuffer) if lenbuffer else None
         mean_noise_std = self.alg.actor_critic.std.mean().item()
-        episode_metrics = self._aggregate_episode_infos(ep_infos)
+        self.episode_metric_history.extend(info.copy() for info in ep_infos)
+        episode_metrics = self._aggregate_episode_infos(list(self.episode_metric_history))
         if mean_reward is not None:
             self.latest_mean_reward = mean_reward
         if mean_episode_length is not None:
@@ -320,6 +327,7 @@ class HIMOnPolicyRunner:
             else:
                 display_episode_length = partial_mean_episode_length
         display_episode_metrics = episode_metrics if episode_metrics else list(self.latest_episode_metrics.items())
+        running_metrics = self._collect_running_episode_metrics(partial_mean_reward, partial_mean_episode_length)
 
         if self.writer is not None:
             self.writer.add_scalar("Loss/value_function", mean_value_loss, iteration)
@@ -339,7 +347,11 @@ class HIMOnPolicyRunner:
             self.writer.add_scalar("Perf/learning_time", learn_time, iteration)
             self.writer.add_scalar("Train/mean_reward", display_reward, iteration)
             self.writer.add_scalar("Train/mean_episode_length", display_episode_length, iteration)
+            self.writer.add_scalar("Train/episodes_completed", episodes_completed, iteration)
+            self.writer.add_scalar("Train/episode_metric_batches", len(self.episode_metric_history), iteration)
             for key, value in display_episode_metrics:
+                self.writer.add_scalar(key, value, iteration)
+            for key, value in running_metrics.items():
                 self.writer.add_scalar(key, value, iteration)
 
         width = 80
@@ -358,8 +370,12 @@ class HIMOnPolicyRunner:
         log_string += (
             f"{'Mean reward:':>{pad}} {display_reward:.2f}\n"
             f"{'Mean episode length:':>{pad}} {display_episode_length:.2f}\n"
+            f"{'Episodes completed this iteration:':>{pad}} {episodes_completed}\n"
+            f"{'Episode metric history batches:':>{pad}} {len(self.episode_metric_history)}\n"
         )
         for key, value in display_episode_metrics:
+            log_string += f"{key:>{pad}}: {value:.4f}\n"
+        for key, value in running_metrics.items():
             log_string += f"{key:>{pad}}: {value:.4f}\n"
         log_string += (
             f"{'-' * width}\n"
@@ -369,6 +385,36 @@ class HIMOnPolicyRunner:
             f"{'ETA:':>{pad}} {self._format_duration(self.tot_time / max(iteration + 1, 1) * (total_iterations - iteration - 1))}\n"
         )
         print(log_string, flush=True)
+
+    def _collect_running_episode_metrics(self, running_reward: float, running_length: float) -> dict[str, float]:
+        """Snapshot metrics for in-progress episodes once per rollout iteration."""
+        env = getattr(self.env, "unwrapped", self.env)
+        metrics = {
+            "Running/episode_reward": running_reward,
+            "Running/episode_length": running_length,
+        }
+
+        reward_sums = getattr(getattr(env, "reward_manager", None), "_episode_sums", {})
+        for term_name, values in reward_sums.items():
+            metrics[f"Running/Episode_Reward/{term_name}"] = self._mean_metric_value(values)
+
+        command_manager = getattr(env, "command_manager", None)
+        if command_manager is not None:
+            command_term = command_manager.get_term("base_velocity")
+            for name, values in command_term.metrics.items():
+                metrics[f"Running/Metrics/base_velocity/{name}"] = self._mean_metric_value(values)
+
+        terrain = getattr(getattr(env, "scene", None), "terrain", None)
+        terrain_levels = getattr(terrain, "terrain_levels", None)
+        if terrain_levels is not None:
+            metrics["Running/Curriculum/terrain_levels"] = self._mean_metric_value(terrain_levels)
+        return metrics
+
+    @staticmethod
+    def _mean_metric_value(value) -> float:
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().float().mean().item())
+        return float(value)
 
     @staticmethod
     def _append_episode_log(ep_infos: list[dict], infos: dict):

@@ -170,14 +170,14 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 惩罚机身 z 方向线速度，抑制“跳跃/颠簸”。
         # 绝对值增大 -> 更追求贴地平稳；过大可能抑制跨越障碍能力。
         self.rewards.lin_vel_z_l2.weight = -10.0
-        # 惩罚机身 x/y 角速度（roll/pitch 旋转速度），降低侧翻和点头抖动。
+        # 惩罚机身 x/y 角速度（roll/pitch 旋转速度），降低侧翻和点头抖动。ii
         self.rewards.ang_vel_xy_l2.weight = -6.0
         # 惩罚机身姿态偏离水平（roll/pitch 倾斜角误差）。
         # 当前关闭，更多依赖速度追踪与接触项“间接”学稳定姿态。
         self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -8.0
+        self.rewards.base_height_l2.weight = -5.0
         # 目标机身高度（单位 m）。
         self.rewards.base_height_l2.params["target_height"] = 0.3
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
@@ -221,9 +221,9 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -15.0
+        self.rewards.action_rate_l2.weight = -2.0
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
-        self.rewards.action_smoothness_2_l2.weight = -0.6
+        self.rewards.action_smoothness_2_l2.weight = -0.3
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
@@ -237,9 +237,9 @@ class ATDogDog2SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 50.0
+        self.rewards.track_lin_vel_xy_exp.weight = 70.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 55.0
+        self.rewards.track_ang_vel_z_exp.weight = 65.0
 
         # Others
         # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。

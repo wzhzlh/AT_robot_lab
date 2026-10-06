@@ -190,9 +190,9 @@ class ATDogDog2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -8.0
+        self.rewards.base_height_l2.weight = -10.0
         # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.3
+        self.rewards.base_height_l2.params["target_height"] = 0.30
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
@@ -220,9 +220,9 @@ class ATDogDog2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.stand_still.weight = -30.0
         # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型。
         self.rewards.joint_pos_penalty.weight = -4.0
-        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 8.0
+        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 4.0
         # 镜像对称惩罚: 约束对角腿运动统计相近，减少“偏腿”步态。
-        self.rewards.joint_mirror.weight = -0.2
+        self.rewards.joint_mirror.weight = -1.0
         # 指定镜像关节对:
         # - FR 对 RL
         # - FL 对 RR
@@ -231,12 +231,11 @@ class ATDogDog2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             ["FR_(hip|thigh|calf).*", "RL_(hip|thigh|calf).*"],
             ["FL_(hip|thigh|calf).*", "RR_(hip|thigh|calf).*"],
         ]
-
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -5.0
+        self.rewards.action_rate_l2.weight = -2.0
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
-        self.rewards.action_smoothness_2_l2.weight = -0.6
+        self.rewards.action_smoothness_2_l2.weight = -1.0
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
@@ -250,9 +249,9 @@ class ATDogDog2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 85.0
+        self.rewards.track_lin_vel_xy_exp.weight = 90.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 60.0
+        self.rewards.track_ang_vel_z_exp.weight = 80.0
 
         # Others
         # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。
@@ -273,30 +272,30 @@ class ATDogDog2RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_stumble.weight = 0.0
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 足端滑动惩罚: 脚着地后相对地面滑移越大，惩罚越大。
-        self.rewards.feet_slide.weight = -8.0
+        self.rewards.feet_slide.weight = -5.0
         self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         # 足端绝对高度目标项（常用于抬脚高度约束），当前关闭。
-        self.rewards.feet_height.weight = -10.
+        self.rewards.feet_height.weight = -15.0
         self.rewards.feet_height.params["target_height"] = 0.08
         self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
         # 相对机身的足端高度惩罚（body frame），约束抬腿轨迹不过高/不过低。
         # target_height=-0.2 表示期望脚位于机身下方一定距离处。
-        self.rewards.feet_height_body.weight = -4.0
-        self.rewards.feet_height_body.params["target_height"] = -0.15
+        self.rewards.feet_height_body.weight = -5.0
+        self.rewards.feet_height_body.params["target_height"] = -0.7
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
-        self.rewards.feet_gait.weight = 12.0
+        self.rewards.feet_gait.weight = 20.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))
         # 当前接触模式约束: 只在有速度命令时启用，抑制 pacing/bounding/四脚跳导致的机身上下弹跳。
-        self.rewards.diagonal_trot_contact_pattern.weight = -1.0
+        self.rewards.diagonal_trot_contact_pattern.weight = -2.0
         self.rewards.diagonal_trot_contact_pattern.params["foot_names"] = ("FL_calf", "FR_calf", "RL_calf", "RR_calf")
         # 机身“向上”姿态奖励（保持重力反方向对齐），提升整体直立稳定性。
-        self.rewards.upward.weight = 0.0
+        self.rewards.upward.weight = 20.0
 
-        self.rewards.feet_distance_y_exp.weight = 2.0
-        self.rewards.feet_distance_y_exp.params["stance_width"] = 0.16
-        self.rewards.feet_distance_y_exp.params["std"] = 0.15
+        self.rewards.feet_distance_y_exp.weight = 5.0
+        self.rewards.feet_distance_y_exp.params["stance_width"] = 0.11
+        self.rewards.feet_distance_y_exp.params["std"] = 0.11
         self.rewards.feet_distance_y_exp.params["asset_cfg"].body_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
 
         # 将权重为0的奖励项禁用，减少无效计算与配置噪声
