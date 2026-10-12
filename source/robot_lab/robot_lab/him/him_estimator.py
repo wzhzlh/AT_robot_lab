@@ -47,7 +47,7 @@ class HIMEstimator(nn.Module):
         temporal_steps: int,
         num_one_step_obs: int,
         vel_slice: tuple[int, int],
-        target_slice: tuple[int, int],
+        target_slices: tuple[tuple[int, int], ...],
         enc_hidden_dims: list[int] | tuple[int, ...] = (128, 64, 16),
         tar_hidden_dims: list[int] | tuple[int, ...] = (128, 64),
         activation: str = "elu",
@@ -64,7 +64,7 @@ class HIMEstimator(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.temperature = temperature
         self.vel_slice = tuple(vel_slice)
-        self.target_slice = tuple(target_slice)
+        self.target_slices = tuple(tuple(part) for part in target_slices)
 
         activation_layer = get_activation(activation)
 
@@ -76,7 +76,7 @@ class HIMEstimator(nn.Module):
         enc_layers.append(nn.Linear(enc_input_dim, self.num_latent + (self.vel_slice[1] - self.vel_slice[0])))
         self.encoder = nn.Sequential(*enc_layers)
 
-        target_input_dim = self.target_slice[1] - self.target_slice[0]
+        target_input_dim = sum(stop - start for start, stop in self.target_slices)
         target_layers: list[nn.Module] = []
         for hidden_dim in tar_hidden_dims:
             target_layers.extend([nn.Linear(target_input_dim, hidden_dim), activation_layer])
@@ -98,7 +98,7 @@ class HIMEstimator(nn.Module):
         self,
         obs_history: torch.Tensor,
         next_critic_obs: torch.Tensor,
-        dones: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
         lr: float | None = None,
     ) -> tuple[float, float]:
         if lr is not None and lr != self.learning_rate:
@@ -106,9 +106,10 @@ class HIMEstimator(nn.Module):
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
 
-        valid_mask = torch.ones(obs_history.shape[0], dtype=torch.bool, device=obs_history.device)
-        if dones is not None:
-            valid_mask &= ~dones.view(-1).bool()
+        if valid_mask is None:
+            valid_mask = torch.ones(obs_history.shape[0], dtype=torch.bool, device=obs_history.device)
+        else:
+            valid_mask = valid_mask.view(-1).bool()
         if not torch.any(valid_mask):
             return 0.0, 0.0
 
@@ -116,7 +117,9 @@ class HIMEstimator(nn.Module):
         next_critic_obs = next_critic_obs[valid_mask]
 
         target_vel = next_critic_obs[:, self.vel_slice[0] : self.vel_slice[1]].detach()
-        target_obs = next_critic_obs[:, self.target_slice[0] : self.target_slice[1]].detach()
+        target_obs = torch.cat(
+            [next_critic_obs[:, start:stop] for start, stop in self.target_slices], dim=-1
+        ).detach()
 
         parts = self.encoder(obs_history)
         pred_vel = parts[..., : self.vel_slice[1] - self.vel_slice[0]]

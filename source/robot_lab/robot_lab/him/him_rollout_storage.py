@@ -15,6 +15,7 @@ class HIMRolloutStorage:
             self.actions = None
             self.rewards = None
             self.dones = None
+            self.estimator_valid = None
             self.values = None
             self.actions_log_prob = None
             self.action_mean = None
@@ -54,6 +55,7 @@ class HIMRolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=device).byte()
+        self.estimator_valid = torch.zeros(num_transitions_per_env, num_envs, 1, device=device).bool()
         self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
         self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
         self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=device)
@@ -72,6 +74,7 @@ class HIMRolloutStorage:
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        self.estimator_valid[self.step].copy_(transition.estimator_valid.view(-1, 1))
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
@@ -115,7 +118,7 @@ class HIMRolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
-        dones = self.dones.flatten(0, 1)
+        estimator_valid = self.estimator_valid.flatten(0, 1)
 
         for _ in range(num_epochs):
             for mini_batch_idx in range(num_mini_batches):
@@ -133,5 +136,5 @@ class HIMRolloutStorage:
                     old_actions_log_prob[batch_idx],
                     old_mu[batch_idx],
                     old_sigma[batch_idx],
-                    dones[batch_idx],
+                    estimator_valid[batch_idx],
                 )

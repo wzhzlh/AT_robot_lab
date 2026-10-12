@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import copy
 import os
+import re
 import statistics
 import time
 from collections import deque
@@ -45,7 +47,7 @@ class HIMOnPolicyRunner:
             "[INFO] HIM observation layout: "
             f"actor_obs={self.env.num_obs}, one_step_obs={self.env.num_one_step_obs}, "
             f"history={actor_critic.history_size}, critic_obs={num_critic_obs}, "
-            f"vel_slice={actor_critic.vel_slice}, target_slice={actor_critic.target_slice}"
+            f"vel_slice={actor_critic.vel_slice}, target_slices={actor_critic.target_slices}"
         )
         self.alg = HIMPPO(actor_critic, device=self.device, **self.alg_cfg)
         self.alg.init_storage(
@@ -76,18 +78,14 @@ class HIMOnPolicyRunner:
             num_critic_obs,
             "estimator_vel_slice",
         )
-        target_slice = self._select_slice(
-            self.policy_cfg.get("estimator_target_slice"),
-            getattr(self.env, "default_estimator_target_slice", None),
-            num_critic_obs,
-            "estimator_target_slice",
-        )
+        target_slices = getattr(self.env, "default_estimator_target_slices", None)
         if vel_slice is None:
             raise ValueError("HIM requires a base_lin_vel term in the critic observation group.")
-        if target_slice is None:
-            raise ValueError("HIM could not infer a contiguous estimator target from policy/critic observations.")
+        if not target_slices:
+            raise ValueError("HIM could not infer estimator target fields from critic observations.")
         self.policy_cfg["estimator_vel_slice"] = vel_slice
-        self.policy_cfg["estimator_target_slice"] = target_slice
+        self.policy_cfg.pop("estimator_target_slice", None)
+        self.policy_cfg["estimator_target_slices"] = target_slices
 
     @staticmethod
     def _is_valid_slice(obs_slice: tuple[int, int] | list[int] | None, upper_bound: int) -> bool:
@@ -136,14 +134,37 @@ class HIMOnPolicyRunner:
             "infos": {
                 "num_one_step_obs": self.alg.actor_critic.num_one_step_obs,
                 "vel_slice": self.alg.actor_critic.vel_slice,
-                "target_slice": self.alg.actor_critic.target_slice,
+                "target_slices": self.alg.actor_critic.target_slices,
             },
+            "observation_contract": self.env.get_observation_contract(),
         }
         torch.save(payload, path)
 
-    def load(self, path: str):
+    def load(self, path: str, allow_legacy: bool = False, inference: bool = False):
         loaded_dict = torch.load(path, map_location=self.device)
-        self._load_model_state(loaded_dict["model_state_dict"])
+        contract = loaded_dict.get("observation_contract")
+        if contract is None and not allow_legacy:
+            raise ValueError("HIM checkpoint has no observation contract; explicit allow_legacy=True is required.")
+        if contract is None:
+            print("[WARN] Loading legacy HIM weights without verified observation or teacher semantics.")
+        if contract is not None:
+            legacy = "format_version" not in contract
+            current_contract = self.env.get_observation_contract(legacy=legacy)
+            saved_contract = copy.deepcopy(contract)
+            if inference:
+                for candidate in (saved_contract, current_contract):
+                    self._relax_inference_contract(candidate)
+            differences = self._contract_differences(saved_contract, current_contract)
+            if differences:
+                details = "\n".join(f"  - {difference}" for difference in differences[:20])
+                if len(differences) > 20:
+                    details += f"\n  - ... {len(differences) - 20} more differences"
+                raise ValueError(
+                    f"HIM checkpoint observation contract differs from the current environment:\n{details}\n"
+                    "Restore the checkpoint's observation configuration or start a new training run. "
+                    "--him_allow_legacy_checkpoint only applies to checkpoints without a contract."
+                )
+        self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"], strict=True)
         if "optimizer_state_dict" in loaded_dict:
             try:
                 self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
@@ -160,27 +181,50 @@ class HIMOnPolicyRunner:
             print("[WARN] HIM checkpoint has no estimator optimizer state. Estimator optimizer starts fresh.")
         self.current_learning_iteration = int(loaded_dict.get("iter", 0))
 
-    def _load_model_state(self, loaded_state: dict[str, torch.Tensor]):
-        current_state = self.alg.actor_critic.state_dict()
-        compatible_state = {}
-        skipped = []
-        for key, value in loaded_state.items():
-            current_value = current_state.get(key)
-            if current_value is not None and current_value.shape == value.shape:
-                compatible_state[key] = value
-            else:
-                current_shape = None if current_value is None else tuple(current_value.shape)
-                skipped.append((key, tuple(value.shape), current_shape))
-        current_state.update(compatible_state)
-        self.alg.actor_critic.load_state_dict(current_state, strict=False)
-        if skipped:
-            print(f"[WARN] Skipped {len(skipped)} incompatible HIM checkpoint tensors:")
-            for key, checkpoint_shape, current_shape in skipped[:20]:
-                print(f"  - {key}: checkpoint={checkpoint_shape}, current={current_shape}")
-            if len(skipped) > 20:
-                print(f"  - ... {len(skipped) - 20} more tensors skipped")
-        if not compatible_state:
-            raise RuntimeError("No compatible HIM model tensors were found in the checkpoint.")
+    @staticmethod
+    def _relax_inference_contract(contract: dict):
+        contract.pop("policy_corruption", None)
+        contract.pop("critic_corruption", None)
+        for group in contract["groups"].values():
+            for term in group:
+                term.pop("noise", None)
+                if term["name"] == "velocity_commands":
+                    term.pop("params", None)
+                    term.pop("scale", None)
+                    term.pop("clip", None)
+                    term.pop("func", None)
+
+    @classmethod
+    def _contract_differences(cls, saved, current, path: str = "") -> list[str]:
+        if isinstance(saved, dict) and isinstance(current, dict):
+            differences = []
+            for key in sorted(saved.keys() | current.keys(), key=str):
+                child_path = f"{path}.{key}" if path else str(key)
+                if key not in saved or key not in current:
+                    differences.append(f"{child_path}: checkpoint={cls._contract_display(saved.get(key, '<missing>'))}, current={cls._contract_display(current.get(key, '<missing>'))}")
+                else:
+                    differences.extend(cls._contract_differences(saved[key], current[key], child_path))
+            return differences
+        if isinstance(saved, list) and isinstance(current, list):
+            differences = []
+            if len(saved) != len(current):
+                differences.append(f"{path}.length: checkpoint={len(saved)}, current={len(current)}")
+            for index, (saved_item, current_item) in enumerate(zip(saved, current)):
+                term_name = saved_item.get("name") if isinstance(saved_item, dict) else None
+                child_path = f"{path}[{index}{':' + term_name if term_name else ''}]"
+                differences.extend(cls._contract_differences(saved_item, current_item, child_path))
+            return differences
+        if isinstance(saved, str) and isinstance(current, str):
+            saved = re.sub(r" at 0x[0-9a-fA-F]+", "", saved)
+            current = re.sub(r" at 0x[0-9a-fA-F]+", "", current)
+        if saved != current:
+            return [f"{path}: checkpoint={cls._contract_display(saved)}, current={cls._contract_display(current)}"]
+        return []
+
+    @staticmethod
+    def _contract_display(value) -> str:
+        rendered = repr(value)
+        return rendered if len(rendered) <= 180 else rendered[:177] + "..."
 
     def get_inference_policy(self, device: str | None = None):
         if device is None:
@@ -231,7 +275,10 @@ class HIMOnPolicyRunner:
                     critic_obs = self._get_critic_observations().to(self.device)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
-                    self.alg.process_env_step(rewards, dones, infos, critic_obs)
+                    next_critic_obs, estimator_valid = self.env.get_estimator_next_critic_observations()
+                    self.alg.process_env_step(
+                        rewards, dones, infos, next_critic_obs.to(self.device), estimator_valid.to(self.device)
+                    )
 
                     cur_reward_sum += rewards.view(-1)
                     cur_episode_length += 1

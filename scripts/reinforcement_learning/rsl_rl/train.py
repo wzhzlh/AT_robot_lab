@@ -32,6 +32,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
@@ -93,7 +94,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-from robot_lab.him import HIMOnPolicyRunner, HIMVecEnvWrapper
+from robot_lab.him import HIMOnPolicyRunner, HIMVecEnvWrapper, align_him_critic_observations
 import robot_lab.tasks  # noqa: F401
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -183,6 +184,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
     apply_him_observation_history(env_cfg, agent_cfg)
+    align_him_critic_observations(env_cfg, agent_cfg)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -272,8 +274,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
       print(f"[INFO]: Loading model checkpoint from: {resume_path}")
       try:
-          runner.load(resume_path)
+          if agent_cfg.class_name == "HIMOnPolicyRunner":
+              runner.load(resume_path, allow_legacy=args_cli.him_allow_legacy_checkpoint)
+          else:
+              runner.load(resume_path)
       except RuntimeError as e:
+          if agent_cfg.class_name == "HIMOnPolicyRunner":
+              raise
           print(f"[WARN] Strict checkpoint loading failed: {e}")
           print("[INFO] Falling back to compatible checkpoint loading.")
           load_compatible_checkpoint(runner, resume_path, load_optimizer=False)

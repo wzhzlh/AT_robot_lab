@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from functools import partial
+import re
 
 import torch
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
@@ -32,6 +35,9 @@ class HIMVecEnvWrapper:
         self.critic_term_slices, _ = self._build_group_layout("critic")
         self.policy_term_names = tuple(self.policy_one_step_term_slices.keys())
         self.critic_term_names = tuple(self.critic_term_slices.keys())
+        self.teacher_target_terms = tuple(name for name in self.policy_term_names if name != "velocity_commands") + (
+            "base_lin_vel",
+        )
 
         inferred_one_step_obs = self._infer_num_one_step_obs()
         requested_one_step_obs = None if num_one_step_obs is None else int(num_one_step_obs)
@@ -54,7 +60,12 @@ class HIMVecEnvWrapper:
             raise ValueError("HIM one-step actor observation dimension is not available.")
         self.num_one_step_obs = int(self.num_one_step_obs)
 
-        self.default_estimator_vel_slice, self.default_estimator_target_slice = self._infer_estimator_slices()
+        self.default_estimator_vel_slice = self._term_slice(self.critic_term_slices, "base_lin_vel")
+        self.default_estimator_target_slices = self._infer_teacher_target_slices()
+        self._terminal_critic_obs = None
+        self._terminal_critic_valid = None
+        self._last_dones = None
+        self._capture_terminal = False
 
         actor_obs, critic_obs = self._split_observations(self._wrapped_env.get_observations())
         self._cache_observations(actor_obs, critic_obs)
@@ -69,22 +80,14 @@ class HIMVecEnvWrapper:
             f"policy_one_step={self.num_one_step_obs}"
         )
 
-        # HIMLocomotion's Dog2 contract: no heading in velocity_commands,
-        # 45-dimensional actor one-step input and 48-dimensional critic input.
         command_slice = self.policy_one_step_term_slices.get("velocity_commands")
         if command_slice is None or command_slice.stop - command_slice.start != 3:
             raise ValueError(
-                "HIM Dog2 requires velocity_commands to be exactly 3-D (vx, vy, yaw), "
+                "HIM requires velocity_commands to be exactly 3-D (vx, vy, yaw), "
                 "without heading."
             )
-        if self.num_one_step_obs != 45:
-            raise ValueError(
-                f"HIM Dog2 actor one-step observation must be 45-D, got {self.num_one_step_obs}."
-            )
-        if self.num_privileged_obs != 48:
-            raise ValueError(
-                f"HIM Dog2 critic observation must be 48-D, got {self.num_privileged_obs}."
-            )
+        if self.num_privileged_obs != self.num_one_step_obs + 3:
+            raise ValueError("HIM critic must contain the policy frame plus 3-D base_lin_vel.")
         if "actions" not in self.policy_one_step_term_slices:
             raise ValueError("HIM policy observation history must include the actions term.")
 
@@ -94,6 +97,7 @@ class HIMVecEnvWrapper:
                 f"actor_obs_dim={self.num_obs}, one_step_dim={self.num_one_step_obs}."
             )
         self.history_length = self.num_obs // self.num_one_step_obs
+        self._install_terminal_capture()
 
     @property
     def unwrapped(self):
@@ -103,19 +107,58 @@ class HIMVecEnvWrapper:
         obs_dict, extras = self._wrapped_env.reset()
         actor_obs, critic_obs = self._split_observations(obs_dict)
         self._cache_observations(actor_obs, critic_obs)
+        self._last_dones = None
         extras = dict(extras)
         if critic_obs is not None:
             extras.setdefault("critic_obs", critic_obs)
         return actor_obs, extras
 
     def step(self, actions: torch.Tensor):
-        obs_dict, rewards, dones, extras = self._wrapped_env.step(actions)
+        self._terminal_critic_obs = None
+        self._terminal_critic_valid = None
+        self._capture_terminal = True
+        try:
+            obs_dict, rewards, dones, extras = self._wrapped_env.step(actions)
+        finally:
+            self._capture_terminal = False
         actor_obs, critic_obs = self._split_observations(obs_dict)
         self._cache_observations(actor_obs, critic_obs)
+        self._last_dones = dones.bool()
         extras = dict(extras)
         if critic_obs is not None:
             extras.setdefault("critic_obs", critic_obs)
         return actor_obs, rewards, dones, extras
+
+    def get_estimator_next_critic_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
+        next_obs = self.get_critic_observations().clone()
+        valid = torch.ones(self.num_envs, device=next_obs.device, dtype=torch.bool)
+        if self._terminal_critic_valid is not None:
+            next_obs[self._terminal_critic_valid] = self._terminal_critic_obs[self._terminal_critic_valid]
+        if self._last_dones is not None:
+            captured = self._terminal_critic_valid
+            if captured is None:
+                captured = torch.zeros_like(valid)
+            valid &= ~self._last_dones | captured
+        return next_obs, valid
+
+    def _install_terminal_capture(self):
+        env = self.unwrapped
+        self._original_reset_idx = env._reset_idx
+
+        def capture_then_reset(env_ids):
+            if not self._capture_terminal:
+                return self._original_reset_idx(env_ids)
+            # Isaac Lab resets done environments before returning from step.
+            terminal = env.observation_manager.compute_group("critic", update_history=False)
+            terminal = self._flatten_group_tensor(terminal)
+            if self._terminal_critic_obs is None:
+                self._terminal_critic_obs = torch.zeros_like(terminal)
+                self._terminal_critic_valid = torch.zeros(self.num_envs, device=terminal.device, dtype=torch.bool)
+            self._terminal_critic_obs[env_ids] = terminal[env_ids]
+            self._terminal_critic_valid[env_ids] = True
+            return self._original_reset_idx(env_ids)
+
+        env._reset_idx = capture_then_reset
 
     def get_observations(self) -> torch.Tensor:
         actor_obs, critic_obs = self._split_observations(self._wrapped_env.get_observations())
@@ -168,8 +211,75 @@ class HIMVecEnvWrapper:
             "critic_terms": self._term_dim_report("critic"),
             "critic_term_names": list(self.critic_term_names),
             "default_estimator_vel_slice": self.default_estimator_vel_slice,
-            "default_estimator_target_slice": self.default_estimator_target_slice,
+            "default_estimator_target_slices": self.default_estimator_target_slices,
+            "teacher_target_terms": list(self.teacher_target_terms),
+            "observation_contract": self.get_observation_contract(),
         }
+
+    @staticmethod
+    def _contract_value(value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, slice):
+            return {"start": value.start, "stop": value.stop, "step": value.step}
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, Mapping):
+            return {str(key): HIMVecEnvWrapper._contract_value(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        if isinstance(value, (tuple, list)):
+            return [HIMVecEnvWrapper._contract_value(item) for item in value]
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "fields": {field.name: HIMVecEnvWrapper._contract_value(getattr(value, field.name)) for field in fields(value)},
+            }
+        if isinstance(value, partial):
+            return {
+                "func": HIMVecEnvWrapper._contract_value(value.func),
+                "args": HIMVecEnvWrapper._contract_value(value.args),
+                "keywords": HIMVecEnvWrapper._contract_value(value.keywords),
+            }
+        if callable(value):
+            func = getattr(value, "__func__", value)
+            if hasattr(func, "__qualname__"):
+                return f"{func.__module__}.{func.__qualname__}"
+            return f"{type(func).__module__}.{type(func).__qualname__}"
+        # Older Isaac Lab config objects may not be dataclasses.
+        return re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+
+    def get_observation_contract(self, legacy: bool = False) -> dict[str, object]:
+        manager = self.unwrapped.observation_manager
+        groups = {}
+        for group in ("policy", "critic"):
+            terms = []
+            for name, cfg in zip(manager._group_obs_term_names[group], manager._group_obs_term_cfgs[group]):
+                noise = cfg.noise
+                term = {
+                    "name": name,
+                    "dim": self._shape_numel(manager.group_obs_term_dim[group][len(terms)]),
+                    "scale": str(cfg.scale) if legacy else self._contract_value(cfg.scale),
+                    "clip": str(cfg.clip) if legacy else self._contract_value(cfg.clip),
+                    "noise": (None if noise is None else str(noise)) if legacy else self._contract_value(noise),
+                    "params": str(cfg.params) if legacy else self._contract_value(cfg.params),
+                }
+                if not legacy:
+                    term["func"] = self._contract_value(cfg.func)
+                    term["modifiers"] = self._contract_value(cfg.modifiers)
+                terms.append(term)
+            groups[group] = terms
+        contract = {
+            "groups": groups,
+            "history_length": self.history_length,
+            "history_layout": "time_major_current_to_oldest",
+            "policy_corruption": bool(self.unwrapped.cfg.observations.policy.enable_corruption),
+            "critic_corruption": bool(self.unwrapped.cfg.observations.critic.enable_corruption),
+            "teacher_target_terms": list(self.teacher_target_terms),
+            "teacher_target_slices": [list(item) for item in self.default_estimator_target_slices],
+            "velocity_slice": list(self.default_estimator_vel_slice),
+        }
+        if not legacy:
+            contract["format_version"] = 2
+        return contract
 
     def _cache_observations(self, actor_obs: torch.Tensor, critic_obs: torch.Tensor | None):
         self._latest_actor_obs = actor_obs
@@ -296,10 +406,15 @@ class HIMVecEnvWrapper:
                 return total_dim
             return total_dim // history_length
 
-    def _infer_estimator_slices(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-        vel_slice = self._term_slice(self.critic_term_slices, "base_lin_vel")
-        target_slice = self._shared_policy_target_slice()
-        return vel_slice, target_slice
+    def _infer_teacher_target_slices(self) -> tuple[tuple[int, int], ...]:
+        missing = [name for name in self.teacher_target_terms if name not in self.critic_term_slices]
+        if missing:
+            raise ValueError(f"HIM teacher target terms missing from critic observations: {missing}")
+        slices = tuple(self._term_slice(self.critic_term_slices, name) for name in self.teacher_target_terms)
+        target_dim = sum(stop - start for start, stop in slices)
+        if target_dim != self.num_one_step_obs:
+            raise ValueError(f"HIM teacher target must be {self.num_one_step_obs}-D, got {target_dim}-D.")
+        return slices
 
     @staticmethod
     def _term_slice(layout: dict[str, slice], term_name: str) -> tuple[int, int] | None:
@@ -307,29 +422,6 @@ class HIMVecEnvWrapper:
         if term_slice is None:
             return None
         return (term_slice.start, term_slice.stop)
-
-    def _shared_policy_target_slice(self) -> tuple[int, int] | None:
-        if not self.policy_term_slices or not self.critic_term_slices:
-            return None
-
-        # HIM target is exactly policy terms shared with critic, excluding the
-        # privileged estimator target (base_lin_vel). Do not include future
-        # shared terms implicitly unless they are part of the policy input.
-        shared_names = [
-            name for name in self.policy_term_slices
-            if name != "base_lin_vel" and name in self.critic_term_slices
-        ]
-        if not shared_names:
-            return None
-
-        slices = [self.critic_term_slices[name] for name in shared_names]
-        start = slices[0].start
-        stop = slices[0].stop
-        for term_slice in slices[1:]:
-            if term_slice.start != stop:
-                return None
-            stop = term_slice.stop
-        return (start, stop)
 
     @staticmethod
     def _shape_numel(shape) -> int:
@@ -344,3 +436,7 @@ class HIMVecEnvWrapper:
 
     def __getattr__(self, name: str):
         return getattr(self._wrapped_env, name)
+
+    def close(self):
+        self.unwrapped._reset_idx = self._original_reset_idx
+        return self._wrapped_env.close()

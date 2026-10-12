@@ -80,8 +80,10 @@ class HIMPPO:
         dones: torch.Tensor,
         infos: dict,
         next_critic_obs: torch.Tensor,
+        estimator_valid: torch.Tensor,
     ):
         self.transition.next_critic_observations = next_critic_obs.clone()
+        self.transition.estimator_valid = estimator_valid
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         if isinstance(infos, dict) and "time_outs" in infos:
@@ -114,7 +116,7 @@ class HIMPPO:
             old_actions_log_prob_batch,
             old_mu_batch,
             old_sigma_batch,
-            dones_batch,
+            estimator_valid_batch,
         ) in generator:
             self.actor_critic.act(obs_batch)
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
@@ -143,7 +145,8 @@ class HIMPPO:
             estimation_loss, swap_loss = self.actor_critic.estimator.update(
                 obs_batch,
                 next_critic_obs_batch,
-                dones=dones_batch,
+                valid_mask=estimator_valid_batch,
+                lr=self.learning_rate,
             )
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))

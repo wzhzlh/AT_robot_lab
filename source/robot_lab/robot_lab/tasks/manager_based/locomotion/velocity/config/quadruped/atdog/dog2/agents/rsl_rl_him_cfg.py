@@ -16,9 +16,8 @@ class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     estimator_max_grad_norm = 10.0
     estimator_num_prototypes = 32
     estimator_temperature = 3.0
-    # Dog2 critic layout: base_lin_vel(0:3) followed by the 45-D policy frame.
+    # The runner derives teacher fields from the live critic observation layout.
     estimator_vel_slice = (0, 3)
-    estimator_target_slice = (3, 48)
 
 
 @configclass

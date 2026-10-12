@@ -68,7 +68,7 @@ def _build_him_deployment_metadata(actor_critic, env) -> dict[str, object]:
         "history_length": int(actor_critic.history_size),
         "num_actions": int(actor_critic.num_actions),
         "estimator_vel_slice": list(actor_critic.vel_slice),
-        "estimator_target_slice": list(actor_critic.target_slice),
+        "estimator_target_slices": [list(part) for part in actor_critic.target_slices],
         "history_layout": "time_major_current_to_oldest",
     }
     if env is None or not hasattr(env, "get_him_deployment_metadata"):

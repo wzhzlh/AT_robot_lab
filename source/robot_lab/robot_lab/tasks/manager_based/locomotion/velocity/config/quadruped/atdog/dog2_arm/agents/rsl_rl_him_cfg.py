@@ -17,7 +17,6 @@ class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     estimator_num_prototypes = 32
     estimator_temperature = 3.0
     estimator_vel_slice = None
-    estimator_target_slice = None
 
 
 @configclass

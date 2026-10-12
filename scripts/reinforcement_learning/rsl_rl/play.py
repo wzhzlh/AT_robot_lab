@@ -42,6 +42,7 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--keyboard", action="store_true", default=False, help="Whether to use keyboard.")
+parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
 parser.add_argument(
     "--export_only",
     action="store_true",
@@ -94,6 +95,7 @@ from robot_lab.him import (
     export_him_deployment_metadata,
     export_him_policy_as_jit,
     export_him_policy_as_onnx,
+    align_him_critic_observations,
 )
 import robot_lab.tasks  # noqa: F401
 
@@ -123,6 +125,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 64
     apply_him_observation_history(env_cfg, agent_cfg)
+    align_him_critic_observations(env_cfg, agent_cfg)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -219,7 +222,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = HIMOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    if agent_cfg.class_name == "HIMOnPolicyRunner":
+        runner.load(resume_path, inference=True, allow_legacy=args_cli.him_allow_legacy_checkpoint)
+    else:
+        runner.load(resume_path)
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)

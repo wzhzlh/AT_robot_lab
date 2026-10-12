@@ -30,7 +30,7 @@ class HIMActorCritic(nn.Module):
         estimator_num_prototypes: int = 32,
         estimator_temperature: float = 3.0,
         estimator_vel_slice: tuple[int, int] | None = None,
-        estimator_target_slice: tuple[int, int] | None = None,
+        estimator_target_slices: tuple[tuple[int, int], ...] | None = None,
         **_: object,
     ):
         super().__init__()
@@ -44,16 +44,16 @@ class HIMActorCritic(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_actions = num_actions
         self.num_one_step_obs = num_one_step_obs
-        if estimator_vel_slice is None or estimator_target_slice is None:
+        if estimator_vel_slice is None or estimator_target_slices is None:
             raise ValueError(
                 "HIMActorCritic requires runner-injected estimator_vel_slice and "
-                "estimator_target_slice derived from the live observation layout."
+                "estimator_target_slices derived from the live observation layout."
             )
         self.vel_slice = tuple(estimator_vel_slice)
-        self.target_slice = tuple(estimator_target_slice)
+        self.target_slices = tuple(tuple(part) for part in estimator_target_slices)
         for name, obs_slice, upper in (
             ("estimator_vel_slice", self.vel_slice, num_critic_obs),
-            ("estimator_target_slice", self.target_slice, num_critic_obs),
+            *(("estimator_target_slices", part, num_critic_obs) for part in self.target_slices),
         ):
             if len(obs_slice) != 2 or not (0 <= obs_slice[0] < obs_slice[1] <= upper):
                 raise ValueError(f"Invalid {name}={obs_slice} for critic observation dim {upper}.")
@@ -66,7 +66,7 @@ class HIMActorCritic(nn.Module):
             temporal_steps=self.history_size,
             num_one_step_obs=num_one_step_obs,
             vel_slice=self.vel_slice,
-            target_slice=self.target_slice,
+            target_slices=self.target_slices,
             enc_hidden_dims=estimator_encoder_hidden_dims,
             tar_hidden_dims=estimator_target_hidden_dims,
             activation=activation,
