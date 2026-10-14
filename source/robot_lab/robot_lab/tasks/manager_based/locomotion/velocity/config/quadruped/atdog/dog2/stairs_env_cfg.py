@@ -35,7 +35,7 @@ DOG2_STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.09, 0.11),#(最初0.07-0.13)
+            step_height_range=(0.07, 0.1),#(最初0.07-0.13)
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -43,7 +43,7 @@ DOG2_STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
         ),
         "stairs2": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.09, 0.11),
+            step_height_range=(0.07, 0.1),
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -194,9 +194,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -50.0
+        self.rewards.base_height_l2.weight = -30.0
         # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.34
+        self.rewards.base_height_l2.params["target_height"] = 0.32
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
@@ -254,9 +254,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 55.0
+        self.rewards.track_lin_vel_xy_exp.weight = 95.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 30.0
+        self.rewards.track_ang_vel_z_exp.weight = 80.0
 
         # Others
         # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。
@@ -282,12 +282,12 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         # 足端绝对高度目标项（常用于抬脚高度约束），当前关闭。
         self.rewards.feet_height.weight = -10.0
-        self.rewards.feet_height.params["target_height"] = 0.08
+        self.rewards.feet_height.params["target_height"] = 0.12
         self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
         # 相对机身的足端高度惩罚（body frame），约束抬腿轨迹不过高/不过低。
         # target_height=-0.2 表示期望脚位于机身下方一定距离处。
-        self.rewards.feet_height_body.weight = -4.0
-        self.rewards.feet_height_body.params["target_height"] = -0.15
+        self.rewards.feet_height_body.weight = -10.0
+        self.rewards.feet_height_body.params["target_height"] = -0.20
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
         self.rewards.feet_gait.weight = 12.0
@@ -308,9 +308,8 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
             self.disable_zero_weight_rewards()
 
         # ------------------------------Terminations 终止条件------------------------------
-        # self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name, ".*_hip"]
-        # 关闭非法接触终止（由奖励项去“软约束”）
-        self.terminations.illegal_contact = None
+        # End the episode when the base or a hip hits the ground; the environment resets it automatically.
+        self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name, ".*_hip"]
 
         # ------------------------------Curriculums 课程学习------------------------------
         # self.curriculum.command_levels.params["range_multiplier"] = (0.2, 1.0)

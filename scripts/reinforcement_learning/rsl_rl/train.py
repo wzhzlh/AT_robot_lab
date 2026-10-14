@@ -34,6 +34,12 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for the en
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
 parser.add_argument(
+    "--load_experiment_name",
+    type=str,
+    default=None,
+    help="Experiment folder containing the checkpoint; defaults to the current task's experiment folder.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -239,7 +245,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        load_log_root_path = log_root_path
+        if args_cli.load_experiment_name is not None:
+            load_log_root_path = str((PROJECT_ROOT / "logs" / "rsl_rl" / args_cli.load_experiment_name).resolve())
+        resume_path = get_checkpoint_path(load_log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:

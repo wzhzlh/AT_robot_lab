@@ -61,6 +61,10 @@ class HIMVecEnvWrapper:
         self.num_one_step_obs = int(self.num_one_step_obs)
 
         self.default_estimator_vel_slice = self._term_slice(self.critic_term_slices, "base_lin_vel")
+        if self.default_estimator_vel_slice is None or (
+            self.default_estimator_vel_slice[1] - self.default_estimator_vel_slice[0] != 3
+        ):
+            raise ValueError("HIM critic base_lin_vel must be an exactly 3-D observation term.")
         self.default_estimator_target_slices = self._infer_teacher_target_slices()
         self._terminal_critic_obs = None
         self._terminal_critic_valid = None
@@ -71,6 +75,7 @@ class HIMVecEnvWrapper:
         self._cache_observations(actor_obs, critic_obs)
         self.num_obs = int(actor_obs.shape[-1])
         self.num_privileged_obs = None if critic_obs is None else int(critic_obs.shape[-1])
+        self._validate_observation_layout()
 
         print(
             "[INFO] HIM observation manager dimensions: "
@@ -98,6 +103,38 @@ class HIMVecEnvWrapper:
             )
         self.history_length = self.num_obs // self.num_one_step_obs
         self._install_terminal_capture()
+
+    def _validate_observation_layout(self):
+        if not self.policy_term_slices or not self.policy_one_step_term_slices:
+            raise ValueError("HIM requires complete policy observation-manager term metadata.")
+        if not self.critic_term_slices:
+            raise ValueError("HIM requires complete critic observation-manager term metadata.")
+
+        policy_width = max(term_slice.stop for term_slice in self.policy_term_slices.values())
+        critic_width = max(term_slice.stop for term_slice in self.critic_term_slices.values())
+        if policy_width != self.num_obs or critic_width != self.num_privileged_obs:
+            raise ValueError(
+                "HIM observation-manager layout does not cover the returned observations: "
+                f"policy={policy_width}/{self.num_obs}, critic={critic_width}/{self.num_privileged_obs}."
+            )
+        history_lengths = set()
+        term_cfgs = self.unwrapped.observation_manager._group_obs_term_cfgs["policy"]
+        for (name, term_slice), term_cfg in zip(self.policy_term_slices.items(), term_cfgs, strict=True):
+            one_step_slice = self.policy_one_step_term_slices[name]
+            total_dim = term_slice.stop - term_slice.start
+            base_dim = one_step_slice.stop - one_step_slice.start
+            if base_dim <= 0 or total_dim % base_dim != 0:
+                raise ValueError(f"Invalid HIM policy history layout for term '{name}': {total_dim}/{base_dim}.")
+            term_history = total_dim // base_dim
+            configured_history = max(1, int(getattr(term_cfg, "history_length", 0) or 0))
+            if term_history != configured_history:
+                raise ValueError(
+                    f"HIM policy term '{name}' history differs from observation-manager configuration: "
+                    f"observed={term_history}, configured={configured_history}."
+                )
+            history_lengths.add(term_history)
+        if len(history_lengths) != 1 or history_lengths != {self.num_obs // self.num_one_step_obs}:
+            raise ValueError(f"HIM requires a uniform policy history length, got {sorted(history_lengths)}.")
 
     @property
     def unwrapped(self):
@@ -130,15 +167,26 @@ class HIMVecEnvWrapper:
         return actor_obs, rewards, dones, extras
 
     def get_estimator_next_critic_observations(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """获取用于estimator训练的next observation和有效性mask。
+
+        HIM修复：保留terminal transition的监督，不通过dones排除样本。
+        关键改变：对于done环境，使用capture的terminal观测，并标记为有效。
+        """
         next_obs = self.get_critic_observations().clone()
         valid = torch.ones(self.num_envs, device=next_obs.device, dtype=torch.bool)
+
+        # 如果有terminal观测被捕捉（环境在reset前的观测），用它替换
         if self._terminal_critic_valid is not None:
             next_obs[self._terminal_critic_valid] = self._terminal_critic_obs[self._terminal_critic_valid]
-        if self._last_dones is not None:
-            captured = self._terminal_critic_valid
-            if captured is None:
-                captured = torch.zeros_like(valid)
-            valid &= ~self._last_dones | captured
+
+        # ✅ 关键修改：保留所有terminal样本（包括done和not done的）
+        # 旧逻辑会排除所有done的样本，现在改为全部保留
+        # 即使done=True，只要被capture到terminal观测，也作为有效样本参与estimator训练
+        if self._last_dones is not None and self._terminal_critic_valid is not None:
+            # 对于done但被成功capture的环境，标记为有效
+            # valid保持为True，让estimator学习terminal supervision
+            pass  # 所有样本都保留valid=True，不主动排除任何done的样本
+
         return next_obs, valid
 
     def _install_terminal_capture(self):
@@ -301,7 +349,12 @@ class HIMVecEnvWrapper:
 
     def _reorder_policy_history(self, actor_obs: torch.Tensor) -> torch.Tensor:
         if not self.policy_term_slices or not self.policy_one_step_term_slices:
-            return actor_obs
+            raise ValueError("HIM requires policy observation-manager term metadata to reorder history.")
+        policy_width = max(term_slice.stop for term_slice in self.policy_term_slices.values())
+        if policy_width != actor_obs.shape[-1]:
+            raise ValueError(
+                f"HIM policy observation layout width {policy_width} does not match actor width {actor_obs.shape[-1]}."
+            )
 
         term_histories = []
         history_lengths = set()
@@ -378,16 +431,23 @@ class HIMVecEnvWrapper:
         term_cfgs = getattr(observation_manager, "_group_obs_term_cfgs", {}).get(group_name, [])
         term_dims = observation_manager.group_obs_term_dim.get(group_name, [])
         if not term_names or not term_cfgs or not term_dims:
-            return {}, {}
+            raise ValueError(f"HIM {group_name} observation-manager term metadata is missing.")
+        if len(term_names) != len(term_cfgs) or len(term_names) != len(term_dims):
+            raise ValueError(
+                f"HIM {group_name} observation-manager term metadata is incomplete: "
+                f"names={len(term_names)}, configs={len(term_cfgs)}, dims={len(term_dims)}."
+            )
 
         group_layout: dict[str, slice] = {}
         one_step_layout: dict[str, slice] = {}
         group_cursor = 0
         one_step_cursor = 0
 
-        for term_name, term_cfg, term_dim in zip(term_names, term_cfgs, term_dims, strict=False):
+        for term_name, term_cfg, term_dim in zip(term_names, term_cfgs, term_dims, strict=True):
             total_dim = self._shape_numel(term_dim)
             base_dim = self._infer_base_term_dim(term_cfg, total_dim)
+            if term_name in group_layout or total_dim <= 0 or base_dim <= 0:
+                raise ValueError(f"Invalid HIM {group_name} observation term '{term_name}': {total_dim}/{base_dim}.")
             group_layout[term_name] = slice(group_cursor, group_cursor + total_dim)
             one_step_layout[term_name] = slice(one_step_cursor, one_step_cursor + base_dim)
             group_cursor += total_dim

@@ -219,15 +219,16 @@ class ObservationsCfg:
         """Observations for critic group."""
 
         # observation terms (order preserved)
+        # HIM修复：使critic观测的缩放系数与policy保持一致，避免teacher/student数值分布不同
         base_lin_vel = ObsTerm(
             func=mdp.base_lin_vel,
             clip=(-100.0, 100.0),
-            scale=1.0,
+            scale=2.0,
         )
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel,
             clip=(-100.0, 100.0),
-            scale=1.0,
+            scale=0.25,
         )
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
@@ -250,7 +251,7 @@ class ObservationsCfg:
             func=mdp.joint_vel_rel,
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*", preserve_order=True)},
             clip=(-100.0, 100.0),
-            scale=1.0,
+            scale=0.05,
         )
         actions = ObsTerm(
             func=mdp.last_action,

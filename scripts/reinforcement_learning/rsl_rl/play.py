@@ -123,7 +123,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else 64
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = args_cli.num_envs
+    else:
+        env_cfg.scene.num_envs = 16 if "Tires-ATDog-Dog2" in args_cli.task else 64
     apply_him_observation_history(env_cfg, agent_cfg)
     align_him_critic_observations(env_cfg, agent_cfg)
 
@@ -139,6 +142,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.scene.terrain.terrain_generator.num_rows = 5
         env_cfg.scene.terrain.terrain_generator.num_cols = 5
         env_cfg.scene.terrain.terrain_generator.curriculum = False
+        if "Tires-ATDog-Dog2" in task_name:
+            env_cfg.scene.terrain.terrain_generator.num_rows = 1
+            env_cfg.scene.terrain.terrain_generator.num_cols = env_cfg.scene.num_envs
 
     # disable randomization for play
     env_cfg.observations.policy.enable_corruption = False

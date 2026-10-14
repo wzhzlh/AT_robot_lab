@@ -313,9 +313,8 @@ class ATDogDog2BarEnvCfg(LocomotionVelocityRoughEnvCfg):
             self.disable_zero_weight_rewards()
 
         # ------------------------------Terminations 终止条件------------------------------
-        # self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name, ".*_hip"]
-        # 关闭非法接触终止（由奖励项去“软约束”）
-        self.terminations.illegal_contact = None
+        # End the episode when the base or a hip hits the ground; the environment resets it automatically.
+        self.terminations.illegal_contact.params["sensor_cfg"].body_names = [self.base_link_name, ".*_hip"]
 
         # ------------------------------Curriculums 课程学习------------------------------
         # 平地任务关闭地形课程，避免继续访问 terrain_generator

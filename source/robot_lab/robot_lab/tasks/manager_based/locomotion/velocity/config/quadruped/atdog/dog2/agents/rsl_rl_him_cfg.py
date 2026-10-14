@@ -16,8 +16,7 @@ class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     estimator_max_grad_norm = 10.0
     estimator_num_prototypes = 32
     estimator_temperature = 3.0
-    # The runner derives teacher fields from the live critic observation layout.
-    estimator_vel_slice = (0, 3)
+    estimator_vel_slice = None
 
 
 @configclass
@@ -160,3 +159,10 @@ class ATDogDog2BarHIMRunnerCfg(ATDogDog2RoughHIMRunnerCfg):
 
         self.max_iterations = 5000
         self.experiment_name = "atdog_dog2_bar_him"
+
+
+@configclass
+class ATDogDog2TiresHIMRunnerCfg(ATDogDog2RoughHIMRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "atdog_dog2_tires_him"

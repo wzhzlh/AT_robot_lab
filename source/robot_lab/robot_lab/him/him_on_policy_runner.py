@@ -28,6 +28,12 @@ class HIMOnPolicyRunner:
         self.save_interval = int(train_cfg["save_interval"])
         self.max_iterations = int(train_cfg.get("max_iterations", 0))
 
+        configured_history = self.policy_cfg.pop("history_length", None)
+        if configured_history is not None and int(configured_history) != self.env.history_length:
+            raise ValueError(
+                "HIM policy history length differs from the live observation history: "
+                f"configured={configured_history}, actual={self.env.history_length}."
+            )
         self.policy_cfg.pop("num_one_step_obs", None)
         if self.env.num_privileged_obs is None:
             raise ValueError(
@@ -79,8 +85,8 @@ class HIMOnPolicyRunner:
             "estimator_vel_slice",
         )
         target_slices = getattr(self.env, "default_estimator_target_slices", None)
-        if vel_slice is None:
-            raise ValueError("HIM requires a base_lin_vel term in the critic observation group.")
+        if vel_slice is None or vel_slice[1] - vel_slice[0] != 3:
+            raise ValueError("HIM requires an inferred, exactly 3-D base_lin_vel term in the critic observation group.")
         if not target_slices:
             raise ValueError("HIM could not infer estimator target fields from critic observations.")
         self.policy_cfg["estimator_vel_slice"] = vel_slice
@@ -115,11 +121,7 @@ class HIMOnPolicyRunner:
                     f"Using inferred slice {resolved_slice}."
                 )
             return resolved_slice
-        if self._is_valid_slice(configured_slice, upper_bound):
-            return (int(configured_slice[0]), int(configured_slice[1]))
-        if configured_slice is not None:
-            raise ValueError(f"Invalid HIM {slice_name}={tuple(configured_slice)} for critic dim {upper_bound}.")
-        return None
+        raise ValueError(f"HIM requires a live, valid {slice_name} inferred from the critic observation layout.")
 
     def add_git_repo_to_log(self, source_file: str):
         del source_file
