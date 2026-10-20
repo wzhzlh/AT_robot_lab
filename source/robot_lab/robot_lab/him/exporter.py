@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 _AT_ROBOT_LAB_TERM_NAME_MAP = {
+    "phase": "phase",
     "base_ang_vel": "ang_vel",
     "projected_gravity": "gravity_vec",
     "velocity_commands": "commands",
@@ -77,6 +78,26 @@ def _build_him_deployment_metadata(actor_critic, env) -> dict[str, object]:
     env_metadata = env.get_him_deployment_metadata()
     metadata.update(env_metadata)
 
+    expected_actor_obs_dim = int(actor_critic.num_one_step_obs) * int(actor_critic.history_size)
+    if int(actor_critic.num_actor_obs) != expected_actor_obs_dim:
+        raise ValueError(
+            "HIM actor input dimension does not match its frame history: "
+            f"actor={actor_critic.num_actor_obs}, "
+            f"frame={actor_critic.num_one_step_obs}, history={actor_critic.history_size}."
+        )
+    if int(env_metadata.get("one_step_obs_dim", -1)) != int(actor_critic.num_one_step_obs):
+        raise ValueError(
+            "HIM environment frame dimension does not match the actor: "
+            f"environment={env_metadata.get('one_step_obs_dim')}, "
+            f"actor={actor_critic.num_one_step_obs}."
+        )
+    if int(env_metadata.get("actor_obs_dim", -1)) != int(actor_critic.num_actor_obs):
+        raise ValueError(
+            "HIM environment history dimension does not match the actor: "
+            f"environment={env_metadata.get('actor_obs_dim')}, "
+            f"actor={actor_critic.num_actor_obs}."
+        )
+
     policy_terms = env_metadata.get("policy_term_names", [])
     mapped_terms = []
     unsupported_terms = []
@@ -99,7 +120,10 @@ def _build_him_deployment_metadata(actor_critic, env) -> dict[str, object]:
             "observations": mapped_terms,
             "observations_history": list(range(int(env_metadata["history_length"]))),
             "observations_history_priority": "time",
+            "history_layout": "time_major_current_to_oldest",
         }
+        if "gait_cycle_time" in env_metadata:
+            metadata["recommended_at_robot_lab_history"]["cycle_time"] = env_metadata["gait_cycle_time"]
     return metadata
 
 
@@ -124,12 +148,16 @@ def export_him_deployment_metadata(
         at_robot_lab_path = os.path.join(path, at_robot_lab_filename)
         lines = [
             "# Copy these fields into an AT_robot-lab policy config section.",
-            f"# policy_input_dim: {recommended['policy_input_dim']}",
             f"num_observations: {recommended['num_observations']}",
             f"observations: {json.dumps(recommended['observations'])}",
+            f"expected_observations: {json.dumps(recommended['observations'])}",
             f"observations_history: {json.dumps(recommended['observations_history'])}",
             f'observations_history_priority: "{recommended["observations_history_priority"]}"',
+            f"expected_policy_input_dim: {recommended['policy_input_dim']}",
+            f'expected_history_layout: "{recommended["history_layout"]}"',
         ]
+        if "cycle_time" in recommended:
+            lines.append(f"cycle_time: {recommended['cycle_time']}")
         with open(at_robot_lab_path, "w", encoding="ascii") as file:
             file.write("\n".join(lines) + "\n")
 

@@ -8,7 +8,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class RslRlHimActorCriticCfg(RslRlPpoActorCriticCfg):
     class_name = "HIMActorCritic"
-    num_one_step_obs = 45
+    num_one_step_obs = 47
     history_length = 6
     estimator_encoder_hidden_dims = [128, 64, 16]
     estimator_target_hidden_dims = [128, 64]

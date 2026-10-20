@@ -8,6 +8,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from .periodic_gait import configure_body_height_reward, configure_periodic_gait
 
 ##
 # Pre-defined configs
@@ -35,7 +36,7 @@ DOG2_STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
     sub_terrains={
         "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.07, 0.1),#(最初0.07-0.13)
+            step_height_range=(0.09, 0.11),#(最初0.07-0.13)
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -43,7 +44,7 @@ DOG2_STAIRS_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
         ),
         "stairs2": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.07, 0.1),
+            step_height_range=(0.09, 0.11),
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -76,6 +77,7 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
     def __post_init__(self):
         # 先继承父类默认配置，再按 ATDog Dog2 粗糙地形任务覆写
         super().__post_init__()
+        configure_periodic_gait(self)
         # 保持采样频率不变（sim.dt 与 decimation 沿用父类），仅将单回合时长设为 2s
         #self.episode_length_s = 2.0
 
@@ -101,9 +103,7 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 说明: 这里常用于做“部分可观测”训练，迫使策略更依赖本体状态
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        # 为了与历史 checkpoint 的网络输入维度保持一致，同时关闭 critic 侧高度扫描观测
-        # 否则 resume 时会出现 critic 第一层权重 shape mismatch（例如 48 vs 235）
-        self.observations.critic.height_scan = None
+        # height_scan 只进入 critic，作为特权地形观测。
         # 明确 joint_pos/joint_vel 仅采集 joint_names 中定义的关节
         self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
         self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
@@ -194,9 +194,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -30.0
+        self.rewards.base_height_l2.weight = -10.0
         # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.32
+        self.rewards.base_height_l2.params["target_height"] = 0.33
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
@@ -221,10 +221,10 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.joint_power.weight = -4.0e-5
         # 静止命令下站立惩罚项（鼓励“该停就停”）。
         # 权重绝对值越大，零速命令时越倾向快速收敛到稳态。
-        self.rewards.stand_still.weight = -30.0
+        self.rewards.stand_still.weight = -10.0
         # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型。
         self.rewards.joint_pos_penalty.weight = -4.0
-        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 8.0
+        self.rewards.joint_pos_penalty.params["stand_still_scale"] =4.0
         # 镜像对称惩罚: 约束对角腿运动统计相近，减少“偏腿”步态。
         self.rewards.joint_mirror.weight = -0.2
         # 指定镜像关节对:
@@ -238,13 +238,13 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -2.0
+        self.rewards.action_rate_l2.weight = -1.5
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
         self.rewards.action_smoothness_2_l2.weight = -0.6
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
-        self.rewards.undesired_contacts.weight = -100.0
+        self.rewards.undesired_contacts.weight = -150.0
         self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{self.foot_link_name}).*"]
         # 足端接触力惩罚，避免落脚冲击过大。
         # 过大可能导致“轻触地”倾向，影响抓地与推进效率。
@@ -254,9 +254,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 95.0
+        self.rewards.track_lin_vel_xy_exp.weight = 70.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 80.0
+        self.rewards.track_ang_vel_z_exp.weight = 50.0
 
         # Others
         # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。
@@ -274,21 +274,22 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_contact_without_cmd.weight = 2.0
         self.rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 绊脚/碰撞惩罚，当前关闭（可按地形难度逐步启用）。
-        self.rewards.feet_stumble.weight = 0.0
+        self.rewards.feet_stumble.weight = 1.0
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 足端滑动惩罚: 脚着地后相对地面滑移越大，惩罚越大。
-        self.rewards.feet_slide.weight = -8.0
+        self.rewards.feet_slide.weight = -4.0
         self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         # 足端绝对高度目标项（常用于抬脚高度约束），当前关闭。
-        self.rewards.feet_height.weight = -10.0
+        self.rewards.feet_height.weight = -30.0
         self.rewards.feet_height.params["target_height"] = 0.12
         self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
         # 相对机身的足端高度惩罚（body frame），约束抬腿轨迹不过高/不过低。
         # target_height=-0.2 表示期望脚位于机身下方一定距离处。
-        self.rewards.feet_height_body.weight = -10.0
+        self.rewards.feet_height_body.weight = -30.0
         self.rewards.feet_height_body.params["target_height"] = -0.20
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
+        configure_body_height_reward(self)
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
         self.rewards.feet_gait.weight = 12.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))

@@ -91,8 +91,12 @@ class HIMVecEnvWrapper:
                 "HIM requires velocity_commands to be exactly 3-D (vx, vy, yaw), "
                 "without heading."
             )
-        if self.num_privileged_obs != self.num_one_step_obs + 3:
-            raise ValueError("HIM critic must contain the policy frame plus 3-D base_lin_vel.")
+        required_critic_dim = self.num_one_step_obs + 3
+        if self.num_privileged_obs < required_critic_dim:
+            raise ValueError(
+                "HIM critic must contain the policy frame and 3-D base_lin_vel; "
+                f"got {self.num_privileged_obs} dimensions, expected at least {required_critic_dim}."
+            )
         if "actions" not in self.policy_one_step_term_slices:
             raise ValueError("HIM policy observation history must include the actions term.")
 
@@ -239,7 +243,7 @@ class HIMVecEnvWrapper:
     def get_him_deployment_metadata(self) -> dict[str, object]:
         one_step_obs_dim = self.num_one_step_obs
         history_length = self.history_length
-        return {
+        metadata = {
             "actor_obs_dim": int(self.num_obs),
             "critic_obs_dim": None if self.num_privileged_obs is None else int(self.num_privileged_obs),
             "one_step_obs_dim": one_step_obs_dim,
@@ -263,6 +267,13 @@ class HIMVecEnvWrapper:
             "teacher_target_terms": list(self.teacher_target_terms),
             "observation_contract": self.get_observation_contract(),
         }
+        if "phase" in self.policy_term_names:
+            manager = self.unwrapped.observation_manager
+            phase_index = manager._group_obs_term_names["policy"].index("phase")
+            metadata["gait_cycle_time"] = float(
+                manager._group_obs_term_cfgs["policy"][phase_index].params["cycle_time"]
+            )
+        return metadata
 
     @staticmethod
     def _contract_value(value):

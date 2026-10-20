@@ -65,6 +65,7 @@ class HIMOnPolicyRunner:
         )
 
         self.log_dir = log_dir
+        self.observation_logger = None
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0.0
@@ -145,6 +146,7 @@ class HIMOnPolicyRunner:
     def load(self, path: str, allow_legacy: bool = False, inference: bool = False):
         loaded_dict = torch.load(path, map_location=self.device)
         contract = loaded_dict.get("observation_contract")
+        critic_height_scan_expanded = False
         if contract is None and not allow_legacy:
             raise ValueError("HIM checkpoint has no observation contract; explicit allow_legacy=True is required.")
         if contract is None:
@@ -157,6 +159,9 @@ class HIMOnPolicyRunner:
                 for candidate in (saved_contract, current_contract):
                     self._relax_inference_contract(candidate)
             differences = self._contract_differences(saved_contract, current_contract)
+            critic_height_scan_expanded = self._is_critic_height_scan_append(saved_contract, current_contract)
+            if critic_height_scan_expanded:
+                differences = []
             if differences:
                 details = "\n".join(f"  - {difference}" for difference in differences[:20])
                 if len(differences) > 20:
@@ -166,8 +171,16 @@ class HIMOnPolicyRunner:
                     "Restore the checkpoint's observation configuration or start a new training run. "
                     "--him_allow_legacy_checkpoint only applies to checkpoints without a contract."
                 )
-        self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"], strict=True)
-        if "optimizer_state_dict" in loaded_dict:
+        model_state = loaded_dict["model_state_dict"]
+        if critic_height_scan_expanded:
+            model_state = self._expand_critic_height_scan_weights(model_state)
+            print(
+                "[WARN] Resuming HIM checkpoint with critic height_scan added: "
+                "copied existing critic weights and zero-initialized the new height_scan input weights. "
+                "The PPO optimizer state starts fresh."
+            )
+        self.alg.actor_critic.load_state_dict(model_state, strict=True)
+        if "optimizer_state_dict" in loaded_dict and not critic_height_scan_expanded:
             try:
                 self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             except (RuntimeError, ValueError):
@@ -182,6 +195,65 @@ class HIMOnPolicyRunner:
         else:
             print("[WARN] HIM checkpoint has no estimator optimizer state. Estimator optimizer starts fresh.")
         self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+
+    @classmethod
+    def _is_critic_height_scan_append(cls, saved: dict, current: dict) -> bool:
+        saved_groups = saved.get("groups")
+        current_groups = current.get("groups")
+        if not isinstance(saved_groups, dict) or not isinstance(current_groups, dict):
+            return False
+        saved_critic = saved_groups.get("critic")
+        current_critic = current_groups.get("critic")
+        if not isinstance(saved_critic, list) or not isinstance(current_critic, list):
+            return False
+        if len(current_critic) != len(saved_critic) + 1:
+            return False
+        if not isinstance(current_critic[-1], dict) or current_critic[-1].get("name") != "height_scan":
+            return False
+
+        comparable_current = copy.deepcopy(current)
+        comparable_current["groups"]["critic"] = comparable_current["groups"]["critic"][:-1]
+        return not cls._contract_differences(saved, comparable_current)
+
+    def _expand_critic_height_scan_weights(self, checkpoint_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        current_state = self.alg.actor_critic.state_dict()
+        adapted_state = dict(current_state)
+        mismatches = []
+        expanded_keys = []
+
+        for key, saved_value in checkpoint_state.items():
+            if key not in current_state:
+                mismatches.append(f"unexpected checkpoint parameter {key}")
+                continue
+            current_value = current_state[key]
+            if saved_value.shape == current_value.shape:
+                adapted_state[key] = saved_value
+            elif (
+                key.startswith("critic.")
+                and key.endswith(".weight")
+                and saved_value.ndim == 2
+                and current_value.ndim == 2
+                and saved_value.shape[0] == current_value.shape[0]
+                and saved_value.shape[1] < current_value.shape[1]
+            ):
+                expanded = torch.zeros_like(current_value)
+                expanded[:, : saved_value.shape[1]].copy_(saved_value)
+                adapted_state[key] = expanded
+                expanded_keys.append(key)
+            else:
+                mismatches.append(
+                    f"{key}: checkpoint shape={tuple(saved_value.shape)}, "
+                    f"current shape={tuple(current_value.shape)}"
+                )
+
+        missing_keys = set(current_state) - set(checkpoint_state)
+        if missing_keys:
+            mismatches.extend(f"missing checkpoint parameter {key}" for key in sorted(missing_keys))
+        if mismatches or len(expanded_keys) != 1:
+            details = "; ".join(mismatches or [f"expected one expanded critic weight, found {expanded_keys}"])
+            raise ValueError(f"Cannot safely expand HIM critic for height_scan: {details}")
+        return adapted_state
+
 
     @staticmethod
     def _relax_inference_contract(contract: dict):
@@ -271,6 +343,8 @@ class HIMOnPolicyRunner:
             episodes_completed = 0
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
+                    if self.observation_logger is not None:
+                        self.observation_logger.record(obs)
                     actions = self.alg.act(obs, critic_obs)
                     obs, rewards, dones, infos = self.env.step(actions)
                     obs = obs.to(self.device)

@@ -33,6 +33,7 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
+parser.add_argument("--log_observations", action="store_true", help="Save ATDog2 HIM observation CSV and Chinese plots in the run log directory.")
 parser.add_argument(
     "--load_experiment_name",
     type=str,
@@ -277,6 +278,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = HIMOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    if args_cli.log_observations:
+        if agent_cfg.class_name != "HIMOnPolicyRunner" or "ATDog-Dog2" not in (args_cli.task or ""):
+            raise ValueError("--log_observations requires an ATDog2 HIM training task")
+        from observation_logger import ObservationLogger
+
+        runner.observation_logger = ObservationLogger(env, log_dir)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
@@ -299,10 +306,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-
-    # close the simulator
-    env.close()
+    try:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    finally:
+        try:
+            if args_cli.log_observations:
+                runner.observation_logger.close()
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":

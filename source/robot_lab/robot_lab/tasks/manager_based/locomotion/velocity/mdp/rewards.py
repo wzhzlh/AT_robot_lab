@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -124,6 +125,25 @@ def joint_pos_penalty(
     )
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+
+def hip_outward_deviation_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    outward_signs: tuple[float, ...] | list[float],
+) -> torch.Tensor:
+    """Penalize hip deviations from default only in each joint's outward direction."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_ids = asset_cfg.joint_ids
+    if len(joint_ids) != len(outward_signs):
+        raise ValueError(
+            f"Expected one outward sign per selected hip joint, got {len(outward_signs)} signs "
+            f"for {len(joint_ids)} joints."
+        )
+    signs = torch.as_tensor(outward_signs, device=asset.device, dtype=asset.data.joint_pos.dtype)
+    joint_deviation = asset.data.joint_pos[:, joint_ids] - asset.data.default_joint_pos[:, joint_ids]
+    outward_deviation = torch.clamp(joint_deviation * signs.unsqueeze(0), min=0.0)
+    return torch.sum(outward_deviation, dim=1)
 
 
 def wheel_vel_penalty(
@@ -483,6 +503,59 @@ def diagonal_trot_contact_pattern(
     reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+
+class PeriodicFootLiftReward(ManagerTermBase):
+    """Match alternating diagonal foot contact to a sinusoidal gait clock."""
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        foot_names = cfg.params["foot_names"]
+        if len(foot_names) != 4:
+            raise ValueError("Periodic foot lift requires feet ordered FL, FR, RL, RR.")
+        self.body_ids = []
+        for name in foot_names:
+            ids, _ = sensor.find_bodies(name)
+            if len(ids) != 1:
+                raise ValueError(f"Expected exactly one contact body for {name!r}, got {len(ids)}.")
+            self.body_ids.append(ids[0])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        sensor_cfg: SceneEntityCfg,
+        foot_names: tuple[str, str, str, str],
+        cycle_time: float,
+        command_name: str,
+        command_threshold: float,
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+        contact = (sensor.data.current_contact_time[:, self.body_ids] > 0.0).float()
+        phase = 2.0 * math.pi * env.episode_length_buf * env.step_dt / cycle_time
+        swing = 0.5 * (torch.sin(phase) + 1.0)
+        desired_air = torch.stack((swing, 1.0 - swing, 1.0 - swing, swing), dim=1)
+        reward = (desired_air * (1.0 - contact) + (1.0 - desired_air) * contact).mean(dim=1)
+        moving = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold
+        return reward * moving
+
+
+def feet_height_body_exp(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+) -> torch.Tensor:
+    """Reward feet as their height in the body frame approaches the target."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_pos = asset.data.body_pos_w[:, asset_cfg.body_ids]
+    relative_pos = foot_pos - asset.data.root_pos_w[:, None, :]
+    root_quat = asset.data.root_quat_w
+    foot_height = torch.stack(
+        [quat_apply_inverse(root_quat, relative_pos[:, index])[:, 2] for index in range(relative_pos.shape[1])],
+        dim=1,
+    )
+    return torch.exp(-torch.square((foot_height - target_height) / std)).mean(dim=1)
 
 
 def feet_stumble(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

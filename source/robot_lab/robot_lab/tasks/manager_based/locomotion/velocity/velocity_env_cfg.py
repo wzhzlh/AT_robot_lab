@@ -202,6 +202,7 @@ class ObservationsCfg:
             clip=(-100.0, 100.0),
             scale=1.0,
         )
+        phase = None
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -258,6 +259,7 @@ class ObservationsCfg:
             clip=(-100.0, 100.0),
             scale=1.0,
         )
+        phase = None
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
@@ -683,6 +685,9 @@ class RewardsCfg:
     # )
 
     upward = RewTerm(func=mdp.upward, weight=0.0)
+    hip_outward_deviation_l1 = None
+    periodic_foot_lift = None
+    feet_height_body_exp = None
 
 
 @configclass
@@ -772,7 +777,12 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
         for attr in dir(self.rewards):
             if not attr.startswith("__"):
                 reward_attr = getattr(self.rewards, attr)
-                if not callable(reward_attr) and reward_attr.weight == 0:
+                if (
+                    reward_attr is not None
+                    and not callable(reward_attr)
+                    and hasattr(reward_attr, "weight")
+                    and reward_attr.weight == 0
+                ):
                     setattr(self.rewards, attr, None)
 
 

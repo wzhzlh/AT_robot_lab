@@ -13,6 +13,7 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from robot_lab.assets.atdog import AT_DOG2_CFG
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from .periodic_gait import configure_body_height_reward, configure_periodic_gait
 from .rough_env_cfg import ATDogDog2RoughEnvCfg
 
 
@@ -130,6 +131,7 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
     def __post_init__(self):
         # 先继承父类默认配置，再按 ATDog Dog2 粗糙地形任务覆写
         super().__post_init__()
+        configure_periodic_gait(self)
         # 保持采样频率不变（sim.dt 与 decimation 沿用父类），仅将单回合时长设为 2s
         #self.episode_length_s = 2.0
 
@@ -155,9 +157,7 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 说明: 这里常用于做“部分可观测”训练，迫使策略更依赖本体状态
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        # 为了与历史 checkpoint 的网络输入维度保持一致，同时关闭 critic 侧高度扫描观测
-        # 否则 resume 时会出现 critic 第一层权重 shape mismatch（例如 48 vs 235）
-        self.observations.critic.height_scan = None
+        # height_scan 只进入 critic，作为特权地形观测。
         # 明确 joint_pos/joint_vel 仅采集 joint_names 中定义的关节
         self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
         self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
@@ -248,9 +248,9 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -30.0
+        self.rewards.base_height_l2.weight = -100.0
         # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.32
+        self.rewards.base_height_l2.params["target_height"] = 0.33
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
@@ -278,7 +278,7 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.stand_still.weight = -30.0
         # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型。
         self.rewards.joint_pos_penalty.weight = -4.0
-        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 8.0
+        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 4.0
         # 镜像对称惩罚: 约束对角腿运动统计相近，减少“偏腿”步态。
         self.rewards.joint_mirror.weight = -0.2
         # 指定镜像关节对:
@@ -335,14 +335,15 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
         self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
         # 足端绝对高度目标项（常用于抬脚高度约束），当前关闭。
-        self.rewards.feet_height.weight = -10.0
-        self.rewards.feet_height.params["target_height"] = 0.12
+        self.rewards.feet_height.weight = -50.0
+        self.rewards.feet_height.params["target_height"] = 0.15
         self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
         # 相对机身的足端高度惩罚（body frame），约束抬腿轨迹不过高/不过低。
         # target_height=-0.2 表示期望脚位于机身下方一定距离处。
-        self.rewards.feet_height_body.weight = -10.0
+        self.rewards.feet_height_body.weight = -50.0
         self.rewards.feet_height_body.params["target_height"] = -0.20
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
+        configure_body_height_reward(self)
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
         self.rewards.feet_gait.weight = 12.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))

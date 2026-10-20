@@ -8,6 +8,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from .periodic_gait import configure_body_height_reward, configure_periodic_gait
 
 ##
 # Pre-defined configs
@@ -80,6 +81,7 @@ class ATDogDog2BarEnvCfg(LocomotionVelocityRoughEnvCfg):
     def __post_init__(self):
         # 先继承父类默认配置，再按 ATDog Dog2 粗糙地形任务覆写
         super().__post_init__()
+        configure_periodic_gait(self)
         # 保持采样频率不变（sim.dt 与 decimation 沿用父类），仅将单回合时长设为 2s
         #self.episode_length_s = 2.0
 
@@ -294,6 +296,7 @@ class ATDogDog2BarEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_height_body.weight = -4.0
         self.rewards.feet_height_body.params["target_height"] = -0.15
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
+        configure_body_height_reward(self)
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
         self.rewards.feet_gait.weight = 12.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))

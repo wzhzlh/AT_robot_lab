@@ -8,6 +8,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from .periodic_gait import configure_body_height_reward, configure_periodic_gait
 
 ##
 # Pre-defined configs
@@ -76,6 +77,7 @@ class ATDogDog2SandEnvCfg(LocomotionVelocityRoughEnvCfg):
     def __post_init__(self):
         # 先继承父类默认配置，再按 ATDog Dog2 粗糙地形任务覆写
         super().__post_init__()
+        configure_periodic_gait(self)
         # 保持采样频率不变（sim.dt 与 decimation 沿用父类），仅将单回合时长设为 2s
         #self.episode_length_s = 2.0
 
@@ -101,9 +103,7 @@ class ATDogDog2SandEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 说明: 这里常用于做“部分可观测”训练，迫使策略更依赖本体状态
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        # 为了与历史 checkpoint 的网络输入维度保持一致，同时关闭 critic 侧高度扫描观测
-        # 否则 resume 时会出现 critic 第一层权重 shape mismatch（例如 48 vs 235）
-        self.observations.critic.height_scan = None
+        # height_scan 只进入 critic，作为特权地形观测。
         # 明确 joint_pos/joint_vel 仅采集 joint_names 中定义的关节
         self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
         self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names
@@ -285,6 +285,7 @@ class ATDogDog2SandEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_height_body.weight = -4.0
         self.rewards.feet_height_body.params["target_height"] = -0.15
         self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
+        configure_body_height_reward(self)
         # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
         self.rewards.feet_gait.weight = 12.0
         self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))
