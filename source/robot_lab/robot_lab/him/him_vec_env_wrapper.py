@@ -19,6 +19,8 @@ class HIMVecEnvWrapper:
         clip_actions: float,
         num_one_step_obs: int | None = None,
         reorder_history: bool = True,
+        history_order: str = "latest_to_oldest",
+        estimator_target_term_names: list[str] | tuple[str, ...] | None = None,
     ):
         self._raw_env = env
         self._wrapped_env = RslRlVecEnvWrapper(env, clip_actions=clip_actions)
@@ -30,13 +32,17 @@ class HIMVecEnvWrapper:
         # Isaac Lab flattens each term's history independently; HIM expects full
         # observation frames concatenated from newest to oldest.
         self.reorder_history = bool(reorder_history)
+        if history_order not in {"latest_to_oldest", "oldest_to_latest"}:
+            raise ValueError(f"Unsupported HIM history_order={history_order!r}.")
+        self.history_order = history_order
+        self.explicit_teacher_target_terms = estimator_target_term_names is not None
 
         self.policy_term_slices, self.policy_one_step_term_slices = self._build_group_layout("policy")
         self.critic_term_slices, _ = self._build_group_layout("critic")
         self.policy_term_names = tuple(self.policy_one_step_term_slices.keys())
         self.critic_term_names = tuple(self.critic_term_slices.keys())
-        self.teacher_target_terms = tuple(name for name in self.policy_term_names if name != "velocity_commands") + (
-            "base_lin_vel",
+        self.teacher_target_terms = tuple(estimator_target_term_names) if estimator_target_term_names else (
+            tuple(name for name in self.policy_term_names if name != "velocity_commands") + ("base_lin_vel",)
         )
 
         inferred_one_step_obs = self._infer_num_one_step_obs()
@@ -248,8 +254,12 @@ class HIMVecEnvWrapper:
             "critic_obs_dim": None if self.num_privileged_obs is None else int(self.num_privileged_obs),
             "one_step_obs_dim": one_step_obs_dim,
             "history_length": history_length,
-            "history_indices_latest_to_oldest": list(range(history_length)),
-            "history_layout": "time_major_current_to_oldest",
+            "history_indices_latest_to_oldest": (
+                list(range(history_length)) if self.history_order == "latest_to_oldest"
+                else list(range(history_length - 1, -1, -1))
+            ),
+            "history_layout": self._history_layout(),
+            "history_order": self.history_order,
             "policy_term_names": list(self.policy_term_names),
             "policy_terms": [
                 {
@@ -329,7 +339,7 @@ class HIMVecEnvWrapper:
         contract = {
             "groups": groups,
             "history_length": self.history_length,
-            "history_layout": "time_major_current_to_oldest",
+            "history_layout": self._history_layout(),
             "policy_corruption": bool(self.unwrapped.cfg.observations.policy.enable_corruption),
             "critic_corruption": bool(self.unwrapped.cfg.observations.critic.enable_corruption),
             "teacher_target_terms": list(self.teacher_target_terms),
@@ -389,9 +399,13 @@ class HIMVecEnvWrapper:
             return actor_obs
 
         frames = []
-        for history_index in range(history_length - 1, -1, -1):
+        history_indices = range(history_length - 1, -1, -1) if self.history_order == "latest_to_oldest" else range(history_length)
+        for history_index in history_indices:
             frames.append(torch.cat([term_history[:, history_index] for term_history in term_histories], dim=-1))
         return torch.cat(frames, dim=-1)
+
+    def _history_layout(self) -> str:
+        return "time_major_current_to_oldest" if self.history_order == "latest_to_oldest" else "time_major_oldest_to_current"
 
     def _extract_group_observations(self, observations, group_name: str) -> torch.Tensor | None:
         if observations is None:
@@ -483,7 +497,7 @@ class HIMVecEnvWrapper:
             raise ValueError(f"HIM teacher target terms missing from critic observations: {missing}")
         slices = tuple(self._term_slice(self.critic_term_slices, name) for name in self.teacher_target_terms)
         target_dim = sum(stop - start for start, stop in slices)
-        if target_dim != self.num_one_step_obs:
+        if target_dim <= 0 or (not self.explicit_teacher_target_terms and target_dim != self.num_one_step_obs):
             raise ValueError(f"HIM teacher target must be {self.num_one_step_obs}-D, got {target_dim}-D.")
         return slices
 

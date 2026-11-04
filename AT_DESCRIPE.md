@@ -117,7 +117,7 @@ cd /workspace/isaaclab_extension_template
 ```bash
 cd /workspace/isaaclab_extension_template
 
- /workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py   --task=RobotLab-Isaac-Velocity-Slope-ATDog-Dog2-v0   --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog2_flat_him/2026-10-10_13-59-30/model_2000.pt     --num_envs=50  --agent=rsl_rl_him_cfg_entry_point 
+ /workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py   --task=RobotLab-Isaac-Velocity-Flat-ATDog-Dog2-v0   --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog2_flat_him/2026-10-22_08-46-12/model_2450.pt     --num_envs=50  --agent=rsl_rl_him_cfg_entry_point 
   
 
 

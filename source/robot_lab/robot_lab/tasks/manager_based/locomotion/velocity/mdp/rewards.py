@@ -529,14 +529,25 @@ class PeriodicFootLiftReward(ManagerTermBase):
         cycle_time: float,
         command_name: str,
         command_threshold: float,
+        progress_weighted: bool = False,
+        phase_from_command: bool = False,
     ) -> torch.Tensor:
         sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
         contact = (sensor.data.current_contact_time[:, self.body_ids] > 0.0).float()
-        phase = 2.0 * math.pi * env.episode_length_buf * env.step_dt / cycle_time
+        if phase_from_command:
+            phase = 2.0 * math.pi * env.command_manager.get_term(command_name).gait_phase
+        else:
+            phase = 2.0 * math.pi * env.episode_length_buf * env.step_dt / cycle_time
         swing = 0.5 * (torch.sin(phase) + 1.0)
         desired_air = torch.stack((swing, 1.0 - swing, 1.0 - swing, swing), dim=1)
         reward = (desired_air * (1.0 - contact) + (1.0 - desired_air) * contact).mean(dim=1)
         moving = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold
+        if progress_weighted:
+            command = env.command_manager.get_command(command_name)[:, :2]
+            target_speed = torch.linalg.norm(command, dim=1)
+            direction = command / target_speed.clamp_min(1.0e-6).unsqueeze(1)
+            actual_speed = torch.sum(env.scene["robot"].data.root_lin_vel_b[:, :2] * direction, dim=1)
+            reward *= torch.clamp(actual_speed / target_speed.clamp_min(0.2), min=0.0, max=1.0)
         return reward * moving
 
 

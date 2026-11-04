@@ -14,6 +14,57 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
 
+def reset_root_state_at_stair_edge(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    pose_range: dict[str, tuple[float, float]],
+    velocity_range: dict[str, tuple[float, float]],
+    platform_width: float,
+    spawn_distance_range: tuple[float, float],
+    lateral_ratio: float,
+    lateral_offset: float = 0.1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Place each robot inside the platform and record its outward command direction."""
+    from isaaclab.envs.mdp import reset_root_state_uniform
+
+    reset_root_state_uniform(env, env_ids, pose_range, velocity_range, asset_cfg)
+    count = len(env_ids)
+    if count == 0:
+        return
+    device = env.scene[asset_cfg.name].device
+    terrain = env.scene.terrain
+    patch_mask = terrain.cfg.terrain_generator.flat_patch_mask
+    if len(patch_mask) != terrain.cfg.terrain_generator.num_rows * terrain.cfg.terrain_generator.num_cols:
+        raise RuntimeError("Stair terrain patch metadata does not match the generated terrain")
+    patch_mask = torch.as_tensor(patch_mask, device=device).reshape(
+        terrain.cfg.terrain_generator.num_rows, terrain.cfg.terrain_generator.num_cols
+    )
+    flat = patch_mask[terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]]
+    if not hasattr(env, "_stair_flat_mask"):
+        env._stair_flat_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+        env._stair_spawn_direction = torch.zeros(env.num_envs, 2, device=device)
+    env._stair_flat_mask[env_ids] = flat
+    stair_ids = env_ids[~flat]
+    count = len(stair_ids)
+    env._stair_spawn_direction[env_ids] = 0.0
+    if count == 0:
+        return
+    lateral = torch.rand(count, device=device) < lateral_ratio
+    sign = torch.where(torch.rand(count, device=device) < 0.5, -1.0, 1.0)
+    direction = torch.stack((torch.where(lateral, 0.0, sign), torch.where(lateral, sign, 0.0)), dim=1)
+    distance = torch.empty(count, device=device).uniform_(*spawn_distance_range)
+    offset = direction * (0.5 * platform_width - distance).unsqueeze(1)
+    sideways = torch.empty(count, device=device).uniform_(-lateral_offset, lateral_offset)
+    offset += torch.stack((-direction[:, 1], direction[:, 0]), dim=1) * sideways.unsqueeze(1)
+
+    asset = env.scene[asset_cfg.name]
+    pose = asset.data.root_pose_w[stair_ids].clone()
+    pose[:, :2] = env.scene.env_origins[stair_ids, :2] + offset
+    asset.write_root_pose_to_sim(pose, env_ids=stair_ids)
+    env._stair_spawn_direction[stair_ids] = direction
+
+
 def randomize_rigid_body_inertia(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

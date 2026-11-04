@@ -35,6 +35,8 @@ class HIMOnPolicyRunner:
                 f"configured={configured_history}, actual={self.env.history_length}."
             )
         self.policy_cfg.pop("num_one_step_obs", None)
+        self.policy_cfg.pop("history_order", None)
+        self.policy_cfg.pop("estimator_target_term_names", None)
         if self.env.num_privileged_obs is None:
             raise ValueError(
                 "HIM requires a dedicated critic observation group; "
@@ -143,10 +145,18 @@ class HIMOnPolicyRunner:
         }
         torch.save(payload, path)
 
-    def load(self, path: str, allow_legacy: bool = False, inference: bool = False):
+    def load(
+        self,
+        path: str,
+        allow_legacy: bool = False,
+        inference: bool = False,
+        allow_observation_migration: bool = False,
+        weights_only: bool = False,
+    ):
         loaded_dict = torch.load(path, map_location=self.device)
         contract = loaded_dict.get("observation_contract")
         critic_height_scan_expanded = False
+        observation_migrated = False
         if contract is None and not allow_legacy:
             raise ValueError("HIM checkpoint has no observation contract; explicit allow_legacy=True is required.")
         if contract is None:
@@ -162,6 +172,10 @@ class HIMOnPolicyRunner:
             critic_height_scan_expanded = self._is_critic_height_scan_append(saved_contract, current_contract)
             if critic_height_scan_expanded:
                 differences = []
+            elif differences and allow_observation_migration and not inference:
+                observation_migrated = self._is_atdog2_observation_migration(saved_contract, current_contract)
+                if observation_migrated:
+                    differences = []
             if differences:
                 details = "\n".join(f"  - {difference}" for difference in differences[:20])
                 if len(differences) > 20:
@@ -169,6 +183,7 @@ class HIMOnPolicyRunner:
                 raise ValueError(
                     f"HIM checkpoint observation contract differs from the current environment:\n{details}\n"
                     "Restore the checkpoint's observation configuration or start a new training run. "
+                    "Use --him_allow_observation_migration only for the known ATDog2 phase/critic-noise change. "
                     "--him_allow_legacy_checkpoint only applies to checkpoints without a contract."
                 )
         model_state = loaded_dict["model_state_dict"]
@@ -179,22 +194,65 @@ class HIMOnPolicyRunner:
                 "copied existing critic weights and zero-initialized the new height_scan input weights. "
                 "The PPO optimizer state starts fresh."
             )
+        if observation_migrated:
+            print(
+                "[WARN] Warm-starting HIM from the previous ATDog2 observation semantics: "
+                "the actor/critic weights are retained, while PPO and estimator optimizer states start fresh. "
+                "The saved iteration count is retained."
+            )
         self.alg.actor_critic.load_state_dict(model_state, strict=True)
-        if "optimizer_state_dict" in loaded_dict and not critic_height_scan_expanded:
+        if "optimizer_state_dict" in loaded_dict and not critic_height_scan_expanded and not observation_migrated and not weights_only:
             try:
                 self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             except (RuntimeError, ValueError):
                 print("[WARN] HIM optimizer state is incompatible with the current model. Skipping optimizer load.")
-        if "estimator_optimizer_state_dict" in loaded_dict:
+        if "estimator_optimizer_state_dict" in loaded_dict and not observation_migrated and not weights_only:
             try:
                 self.alg.actor_critic.estimator.optimizer.load_state_dict(
                     loaded_dict["estimator_optimizer_state_dict"]
                 )
             except (RuntimeError, ValueError):
                 print("[WARN] HIM estimator optimizer state is incompatible. Skipping estimator optimizer load.")
-        else:
+        elif not observation_migrated and not weights_only:
             print("[WARN] HIM checkpoint has no estimator optimizer state. Estimator optimizer starts fresh.")
-        self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+        if weights_only:
+            self.current_learning_iteration = 0
+            print("[INFO] HIM weights initialized; iteration and both optimizer states start fresh.")
+        else:
+            self.current_learning_iteration = int(loaded_dict.get("iter", 0))
+
+    @classmethod
+    def _is_atdog2_observation_migration(cls, saved: dict, current: dict) -> bool:
+        """Accept only the prior ATDog2 phase clock and critic noise semantics."""
+        old_phase = "robot_lab.tasks.manager_based.locomotion.velocity.mdp.observations.phase"
+        new_phase = "robot_lab.tasks.manager_based.locomotion.velocity.mdp.observations.stairs_phase"
+        old_noise_fields = {"base_lin_vel", "base_ang_vel", "projected_gravity", "joint_pos", "joint_vel"}
+        previous = copy.deepcopy(saved)
+        updated = copy.deepcopy(current)
+        if previous.get("critic_corruption") is not True or updated.get("critic_corruption") is not False:
+            return False
+        previous["critic_corruption"] = False
+        try:
+            for group_name in ("policy", "critic"):
+                old = next(term for term in previous["groups"][group_name] if term["name"] == "phase")
+                new = next(term for term in updated["groups"][group_name] if term["name"] == "phase")
+                if old.get("func") != old_phase or old.get("params") != {"cycle_time": 0.5}:
+                    return False
+                if new.get("func") != new_phase or new.get("params") != {"command_name": "base_velocity"}:
+                    return False
+                old["func"] = new["func"]
+                old["params"] = new["params"]
+            for term in previous["groups"]["critic"]:
+                name = term["name"]
+                if name in old_noise_fields:
+                    if term.get("noise") is None:
+                        return False
+                    term["noise"] = None
+                elif term.get("noise") is not None:
+                    return False
+        except (KeyError, StopIteration, TypeError):
+            return False
+        return not cls._contract_differences(previous, updated)
 
     @classmethod
     def _is_critic_height_scan_append(cls, saved: dict, current: dict) -> bool:

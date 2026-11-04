@@ -7,7 +7,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
-from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
+from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg, MySceneCfg
 from .periodic_gait import configure_body_height_reward, configure_periodic_gait
 
 ##
@@ -86,10 +86,11 @@ class ATDogDog2BarEnvCfg(LocomotionVelocityRoughEnvCfg):
         #self.episode_length_s = 2.0
 
         # ------------------------------Scene 场景与传感器------------------------------
-        # 改为平地，关闭 rough terrain generator，并禁用仅粗糙地形需要的扫描器
+        # Use the ground ray caster for privileged critic terrain observations.
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        self.scene.height_scanner = None
+        self.scene.height_scanner = MySceneCfg().height_scanner
+        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
         self.scene.height_scanner_base = None
         # 指定机器人资产，并放置到每个并行环境的 Robot prim 下
         self.scene.robot = AT_DOG2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -107,9 +108,6 @@ class ATDogDog2BarEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 说明: 这里常用于做“部分可观测”训练，迫使策略更依赖本体状态
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        # 为了与历史 checkpoint 的网络输入维度保持一致，同时关闭 critic 侧高度扫描观测
-        # 否则 resume 时会出现 critic 第一层权重 shape mismatch（例如 48 vs 235）
-        self.observations.critic.height_scan = None
         # 明确 joint_pos/joint_vel 仅采集 joint_names 中定义的关节
         self.observations.policy.joint_pos.params["asset_cfg"].joint_names = self.joint_names
         self.observations.policy.joint_vel.params["asset_cfg"].joint_names = self.joint_names

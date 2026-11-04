@@ -33,6 +33,17 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
+parser.add_argument(
+    "--him_allow_observation_migration",
+    action="store_true",
+    help="Warm-start HIM from the earlier noisy-critic and episode-clock stairs observation contract.",
+)
+parser.add_argument(
+    "--him_init_checkpoint",
+    type=str,
+    default=None,
+    help="Initialize a new HIM run from another task's checkpoint weights without optimizer or iteration state.",
+)
 parser.add_argument("--log_observations", action="store_true", help="Save ATDog2 HIM observation CSV and Chinese plots in the run log directory.")
 parser.add_argument(
     "--load_experiment_name",
@@ -184,6 +195,10 @@ def load_compatible_checkpoint(runner, resume_path, load_optimizer=False):
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
+    if args_cli.him_init_checkpoint and (args_cli.resume or agent_cfg.resume):
+        raise ValueError("--him_init_checkpoint starts a new run and cannot be combined with --resume.")
+    if args_cli.him_init_checkpoint and agent_cfg.class_name != "HIMOnPolicyRunner":
+        raise ValueError("--him_init_checkpoint requires a HIM training task.")
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -250,6 +265,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.load_experiment_name is not None:
             load_log_root_path = str((PROJECT_ROOT / "logs" / "rsl_rl" / args_cli.load_experiment_name).resolve())
         resume_path = get_checkpoint_path(load_log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    if args_cli.him_init_checkpoint:
+        init_path = Path(args_cli.him_init_checkpoint).expanduser()
+        if not init_path.is_absolute():
+            init_path = PROJECT_ROOT / init_path
+        if not init_path.is_file():
+            raise FileNotFoundError(f"HIM initialization checkpoint does not exist: {init_path}")
 
     # wrap for video recording
     if args_cli.video:
@@ -265,7 +286,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     if agent_cfg.class_name == "HIMOnPolicyRunner":
-        env = HIMVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions, num_one_step_obs=agent_cfg.policy.num_one_step_obs)
+        env = HIMVecEnvWrapper(
+            env,
+            clip_actions=agent_cfg.clip_actions,
+            num_one_step_obs=agent_cfg.policy.num_one_step_obs,
+            history_order=getattr(agent_cfg.policy, "history_order", "latest_to_oldest"),
+            estimator_target_term_names=getattr(agent_cfg.policy, "estimator_target_term_names", None),
+        )
     else:
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
@@ -291,7 +318,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
       print(f"[INFO]: Loading model checkpoint from: {resume_path}")
       try:
           if agent_cfg.class_name == "HIMOnPolicyRunner":
-              runner.load(resume_path, allow_legacy=args_cli.him_allow_legacy_checkpoint)
+              runner.load(
+                  resume_path,
+                  allow_legacy=args_cli.him_allow_legacy_checkpoint,
+                  allow_observation_migration=args_cli.him_allow_observation_migration,
+              )
           else:
               runner.load(resume_path)
       except RuntimeError as e:
@@ -300,6 +331,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
           print(f"[WARN] Strict checkpoint loading failed: {e}")
           print("[INFO] Falling back to compatible checkpoint loading.")
           load_compatible_checkpoint(runner, resume_path, load_optimizer=False)
+    elif args_cli.him_init_checkpoint:
+        print(f"[INFO]: Initializing HIM model weights from: {init_path}")
+        runner.load(
+            str(init_path),
+            weights_only=True,
+            allow_observation_migration=args_cli.him_allow_observation_migration,
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

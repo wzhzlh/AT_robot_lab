@@ -19,5 +19,11 @@ def align_him_critic_observations(env_cfg, agent_cfg):
         if hasattr(critic, name):
             setattr(critic, name, copy.deepcopy(term))
     critic.base_lin_vel.scale = 2.0
-    critic.base_lin_vel.noise = AdditiveUniformNoiseCfg(n_min=-0.1, n_max=0.1)
-    critic.enable_corruption = True
+    if getattr(env_cfg, "him_clean_critic", False):
+        for term in vars(critic).values():
+            if hasattr(term, "noise"):
+                term.noise = None
+        critic.enable_corruption = False
+    else:
+        critic.base_lin_vel.noise = AdditiveUniformNoiseCfg(n_min=-0.1, n_max=0.1)
+        critic.enable_corruption = True

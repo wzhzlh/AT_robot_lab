@@ -31,6 +31,7 @@ class HIMActorCritic(nn.Module):
         estimator_temperature: float = 3.0,
         estimator_vel_slice: tuple[int, int] | None = None,
         estimator_target_slices: tuple[tuple[int, int], ...] | None = None,
+        actor_current_frame: str = "first",
         **_: object,
     ):
         super().__init__()
@@ -44,6 +45,9 @@ class HIMActorCritic(nn.Module):
         self.num_actor_obs = num_actor_obs
         self.num_actions = num_actions
         self.num_one_step_obs = num_one_step_obs
+        if actor_current_frame not in {"first", "last"}:
+            raise ValueError(f"Unsupported actor_current_frame={actor_current_frame!r}.")
+        self.actor_current_frame = actor_current_frame
         if estimator_vel_slice is None or estimator_target_slices is None:
             raise ValueError(
                 "HIMActorCritic requires runner-injected estimator_vel_slice and "
@@ -123,7 +127,7 @@ class HIMActorCritic(nn.Module):
     def update_distribution(self, obs_history: torch.Tensor):
         with torch.no_grad():
             pred_vel, latent = self.estimator(obs_history)
-        actor_input = torch.cat((obs_history[:, : self.num_one_step_obs], pred_vel, latent), dim=-1)
+        actor_input = torch.cat((self._current_frame(obs_history), pred_vel, latent), dim=-1)
         mean = self.actor(actor_input)
         self.distribution = Normal(mean, mean * 0.0 + self.std)
 
@@ -136,7 +140,12 @@ class HIMActorCritic(nn.Module):
     def act_inference(self, obs_history: torch.Tensor, observations: torch.Tensor | None = None) -> torch.Tensor:
         del observations
         pred_vel, latent = self.estimator(obs_history)
-        return self.actor(torch.cat((obs_history[:, : self.num_one_step_obs], pred_vel, latent), dim=-1))
+        return self.actor(torch.cat((self._current_frame(obs_history), pred_vel, latent), dim=-1))
+
+    def _current_frame(self, obs_history: torch.Tensor) -> torch.Tensor:
+        if self.actor_current_frame == "last":
+            return obs_history[:, -self.num_one_step_obs :]
+        return obs_history[:, : self.num_one_step_obs]
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
         if self.distribution is None:
@@ -145,3 +154,6 @@ class HIMActorCritic(nn.Module):
 
     def evaluate(self, critic_observations: torch.Tensor, **_: object) -> torch.Tensor:
         return self.critic(critic_observations)
+
+    def policy_parameters(self):
+        return list(self.actor.parameters()) + list(self.critic.parameters()) + [self.std]

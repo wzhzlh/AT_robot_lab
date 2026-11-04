@@ -100,6 +100,8 @@ class HIMEstimator(nn.Module):
         next_critic_obs: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
         lr: float | None = None,
+        velocity_loss_coef: float = 1.0,
+        swap_loss_coef: float = 1.0,
     ) -> tuple[float, float]:
         if lr is not None and lr != self.learning_rate:
             self.learning_rate = lr
@@ -140,9 +142,12 @@ class HIMEstimator(nn.Module):
         log_prob_student = F.log_softmax(score_student / self.temperature, dim=-1)
         log_prob_target = F.log_softmax(score_target / self.temperature, dim=-1)
 
-        swap_loss = -0.5 * (assign_student * log_prob_target + assign_target * log_prob_student).mean()
+        swap_loss = -0.5 * (
+            torch.sum(assign_target * log_prob_student, dim=-1).mean()
+            + torch.sum(assign_student * log_prob_target, dim=-1).mean()
+        )
         estimation_loss = F.mse_loss(pred_vel, target_vel)
-        total_loss = estimation_loss + swap_loss
+        total_loss = velocity_loss_coef * estimation_loss + swap_loss_coef * swap_loss
 
         self.optimizer.zero_grad()
         total_loss.backward()

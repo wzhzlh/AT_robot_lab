@@ -1,9 +1,34 @@
 # Copyright (c) 2024-2025 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
 
+import isaaclab.terrains as terrain_gen
 from isaaclab.utils import configclass
+from isaaclab.managers import SceneEntityCfg
 
 from .rough_env_cfg import ATDogDog2RoughEnvCfg
+from .periodic_gait import configure_body_height_reward, configure_periodic_foot_lift_reward
+
+
+ATDOG2_LOW_OBSTACLE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.85),
+        "low_boxes": terrain_gen.MeshRandomGridTerrainCfg(
+            proportion=0.15,
+            grid_width=0.45,
+            grid_height_range=(0.01, 0.025),
+            platform_width=2.0,
+            holes=False,
+        ),
+    },
+)
 
 
 @configclass
@@ -37,13 +62,46 @@ class ATDogDog2FlatEnvCfg(ATDogDog2RoughEnvCfg):
         # change terrain to flat
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        # no height scan
-        # self.scene.height_scanner = None
+        # Keep the ray caster for privileged critic terrain observations.
         self.observations.policy.height_scan = None
-        # self.observations.critic.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None
+        # Keep the command-driven gait phase useful before the stair stage.
+        configure_periodic_foot_lift_reward(self)
+        self.rewards.periodic_foot_lift.weight = 10.0
+        configure_body_height_reward(self)
+        self.rewards.feet_height_body_exp.weight = 20.0
 
         # If the weight of rewards is 0, set rewards to None
         if self.__class__.__name__ == "ATDogDog2FlatEnvCfg":
+            self.events.randomize_rigid_body_mass_base = None
+            self.events.randomize_com_positions = None
+            self.events.randomize_actuator_gains = None
             self.disable_zero_weight_rewards()
+
+
+@configclass
+class ATDogDog2FlatDomainRandEnvCfg(ATDogDog2FlatEnvCfg):
+    """Low-obstacle robustness stage between flat locomotion and stairs."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = ATDOG2_LOW_OBSTACLE_TERRAIN_CFG
+        self.scene.terrain.max_init_terrain_level = None
+        self.rewards.base_height_l2.params["sensor_cfg"] = SceneEntityCfg("height_scanner_base")
+        self.events.randomize_rigid_body_mass_base.params["mass_distribution_params"] = (-0.1, 0.1)
+        self.events.randomize_com_positions.params["com_range"] = {
+            "x": (-0.003, 0.003), "y": (-0.003, 0.003), "z": (-0.002, 0.002)
+        }
+        self.events.randomize_actuator_gains.params["stiffness_distribution_params"] = (0.98, 1.02)
+        self.events.randomize_actuator_gains.params["damping_distribution_params"] = (0.98, 1.02)
+        self.events.randomize_push_robot.interval_range_s = (15.0, 20.0)
+        self.events.randomize_push_robot.params["velocity_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}
+        self.commands.base_velocity.rel_standing_envs = 0.05
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.8, 1.2)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.6, 0.6)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.rewards.periodic_foot_lift.weight = 25.0
+        self.rewards.feet_height_body_exp.weight = 50.0
+        self.disable_zero_weight_rewards()

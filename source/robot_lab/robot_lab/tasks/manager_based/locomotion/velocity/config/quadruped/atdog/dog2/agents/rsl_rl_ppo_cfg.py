@@ -8,7 +8,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class ATDogDog2RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 20000
+    max_iterations = 2000
     save_interval = 100
     experiment_name = "atdog_dog2_rough"
     policy = RslRlPpoActorCriticCfg(
@@ -131,7 +131,7 @@ class ATDogDog2FlatPPORunnerCfg(ATDogDog2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 5000
+        self.max_iterations = 2000
         self.experiment_name = "atdog_dog2_flat"
 
 
