@@ -35,6 +35,4 @@ def phase(env: ManagerBasedRLEnv, cycle_time: float) -> torch.Tensor:
 
 
 def stairs_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    phase_value = env.command_manager.get_term(command_name).gait_phase
-    angle = 2.0 * torch.pi * phase_value
-    return torch.stack((torch.sin(angle), torch.cos(angle)), dim=-1)
+    return env.command_manager.get_term(command_name).gait_clock.observation()

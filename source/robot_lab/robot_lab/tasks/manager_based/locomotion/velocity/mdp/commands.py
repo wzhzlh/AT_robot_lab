@@ -10,6 +10,7 @@ from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
 import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
+from robot_lab.gait import TrotClock, TrotClockCfg, stair_traversal_success
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -66,37 +67,28 @@ class UniformThresholdVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
 class PhaseVelocityCommand(mdp.UniformVelocityCommand):
     """Keep one command-driven gait clock shared by observations and rewards."""
 
-    def __init__(self, cfg: mdp.UniformVelocityCommandCfg, env: ManagerBasedEnv):
+    def __init__(self, cfg: PhaseVelocityCommandCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
-        self.gait_phase = torch.zeros(self.num_envs, device=self.device)
-        self._stop_elapsed = torch.zeros_like(self.gait_phase)
-        self._was_moving = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self._stopping = torch.zeros_like(self._was_moving)
+        self.gait_clock = TrotClock(self.num_envs, self.device, cfg.gait)
+
+    @property
+    def gait_phase(self):
+        return self.gait_clock.phase
 
     def _update_command(self):
         super()._update_command()
-        command = self.vel_command_b
-        moving = (torch.linalg.norm(command[:, :2], dim=1) >= 0.05) | (command[:, 2].abs() >= 0.05)
-        starting_stop = ~moving & self._was_moving
-        self._stopping[starting_stop] = True
-        self._stop_elapsed[starting_stop] = 0.0
-        active = moving | self._stopping
-        self.gait_phase[active] = torch.remainder(
-            self.gait_phase[active] + self._env.step_dt / getattr(self.cfg, "cycle_time", 0.5), 1.0
-        )
-        self._stop_elapsed[self._stopping & ~moving] += self._env.step_dt
-        self._stopping[moving | (self._stop_elapsed >= getattr(self.cfg, "stop_duration", 0.5))] = False
-        self.gait_phase[~moving & ~self._stopping] = 0.0
-        self._was_moving[:] = moving
+        self.gait_clock.update(self.vel_command_b, self._env.step_dt)
 
     def reset(self, env_ids: Sequence[int] | None = None):
         metrics = super().reset(env_ids)
-        ids = slice(None) if env_ids is None else env_ids
-        self.gait_phase[ids] = 0.0
-        self._stop_elapsed[ids] = 0.0
-        self._was_moving[ids] = False
-        self._stopping[ids] = False
+        self.gait_clock.reset(env_ids)
         return metrics
+
+
+@configclass
+class PhaseVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
+    class_type: type = PhaseVelocityCommand
+    gait: TrotClockCfg = TrotClockCfg()
 
 
 class StairsVelocityCommand(PhaseVelocityCommand):
@@ -113,6 +105,10 @@ class StairsVelocityCommand(PhaseVelocityCommand):
         self._start_xy = torch.zeros(self.num_envs, 2, device=self.device)
         self._start_height = torch.zeros(self.num_envs, device=self.device)
         self._travel_direction = torch.zeros_like(self._start_xy)
+        self._contact_sensor = env.scene.sensors["contact_forces"]
+        # Per-body rates identify actual collision sources without weakening penalties.
+        for name in self._contact_sensor.body_names:
+            self.metrics[f"contact_rate/{name}"] = torch.zeros(self.num_envs, device=self.device)
 
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
@@ -136,6 +132,10 @@ class StairsVelocityCommand(PhaseVelocityCommand):
 
     def _update_metrics(self):
         super()._update_metrics()
+        forces = self._contact_sensor.data.net_forces_w_history
+        contacts = forces.norm(dim=-1).amax(dim=1) > 1.0
+        for index, name in enumerate(self._contact_sensor.body_names):
+            self.metrics[f"contact_rate/{name}"] += contacts[:, index].float()
         command = self.vel_command_b[:, :2]
         speed = torch.linalg.norm(command, dim=1)
         moving = speed > self.cfg.min_command_speed
@@ -162,32 +162,35 @@ class StairsVelocityCommand(PhaseVelocityCommand):
 
     def reset(self, env_ids: Sequence[int] | None = None):
         ids = slice(None) if env_ids is None else env_ids
-        flat_mask = getattr(self._env, "_stair_flat_mask", None)
-        eligible = self._had_translation[ids]
-        if flat_mask is not None:
-            eligible = eligible & ~flat_mask[ids]
-        success = (
-            (self.metrics["stair_progress"][ids] >= self.cfg.success_distance)
-            & (self.metrics["stair_height_change"][ids] >= self.cfg.min_height_change)
+        # Reset events may already have assigned the next terrain patch. Eligibility
+        # must describe the completed episode, not the newly assigned patch.
+        eligible = self._had_translation[ids] & self._start_valid[ids]
+        failed = self._env.termination_manager.terminated[ids]
+        success = stair_traversal_success(
+            self.metrics["stair_progress"][ids], self.metrics["stair_height_change"][ids],
+            eligible, failed, self.cfg.success_distance, self.cfg.min_height_change,
         )
         stair_success = (success & eligible).float().sum() / eligible.float().sum().clamp_min(1)
+        episode_steps = self._env.episode_length_buf[ids].clamp_min(1)
+        for name in self._contact_sensor.body_names:
+            self.metrics[f"contact_rate/{name}"][ids] /= episode_steps
         metrics = super().reset(env_ids)
         metrics["stair_success"] = stair_success.item()
+        metrics["stair_eligible_count"] = eligible.sum().item()
+        metrics["stair_success_count"] = success.sum().item()
         self._had_translation[ids] = False
         self._start_valid[ids] = False
         return metrics
 
 
 @configclass
-class StairsVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
+class StairsVelocityCommandCfg(PhaseVelocityCommandCfg):
     class_type: type = StairsVelocityCommand
     stair_speed_range: tuple[float, float] = (0.25, 0.8)
     lateral_ratio: float = 0.35
     min_command_speed: float = 0.2
     success_distance: float = 1.5
     min_height_change: float = 0.06
-    cycle_time: float = 0.5
-    stop_duration: float = 0.5
 
 
 class DiscreteCommandController(CommandTerm):

@@ -15,6 +15,9 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+from isaaclab.utils.warp import raycast_mesh
+
+from robot_lab.gait import contact_violation, foot_geometry, standing_motion_error, swing_clearance_error
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -503,6 +506,175 @@ def diagonal_trot_contact_pattern(
     reward *= torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) > command_threshold
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7
     return reward
+
+
+class GaitContactPenalty(ManagerTermBase):
+    """Phase contact violations; use a negative weight, including through stopping."""
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self.body_ids = []
+        for name in cfg.params["foot_names"]:
+            ids, _ = self.sensor.find_bodies(name)
+            if len(ids) != 1:
+                raise ValueError(f"Expected exactly one contact body for {name!r}, got {len(ids)}.")
+            self.body_ids.append(ids[0])
+        if len(self.body_ids) != 4:
+            raise ValueError("Gait contact feet must be ordered FL, FR, RL, RR.")
+
+    def __call__(self, env, sensor_cfg, foot_names, command_name):
+        clock = env.command_manager.get_term(command_name).gait_clock
+        stance, swing, _ = clock.foot_targets()
+        contact = self.sensor.data.current_contact_time[:, self.body_ids] > 0.0
+        return contact_violation(contact, stance, swing, clock.active)
+
+
+class SwingClearancePenalty(ManagerTermBase):
+    """Track actual sole clearance above terrain, only during planned swing.
+
+    Rays query the terrain mesh already loaded by the privileged height scanner;
+    no extra actor observations or sensors are introduced.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.asset = env.scene[cfg.params["asset_cfg"].name]
+        self.body_ids = cfg.params["asset_cfg"].body_ids
+        self.scanner = env.scene.sensors[cfg.params["terrain_sensor_cfg"].name]
+        self.offsets = torch.tensor(cfg.params["foot_offsets"], device=env.device)
+        if self.offsets.shape != (4, 3) or len(self.body_ids) != 4:
+            raise ValueError("Swing clearance requires four ordered foot bodies and four xyz offsets.")
+
+    def __call__(
+        self, env, asset_cfg, terrain_sensor_cfg, command_name, foot_offsets,
+        foot_radius: float, foot_half_width: float, height: float, std: float,
+        terrain_sample_radius: float = 0.0, lookahead_distance: float = 0.0,
+        deficit_only: bool = False,
+    ):
+        clock = env.command_manager.get_term(command_name).gait_clock
+        _, swing, progress = clock.foot_targets()
+        data = self.asset.data
+        center, extent = foot_geometry(
+            data.body_link_pos_w[:, self.body_ids], data.body_link_quat_w[:, self.body_ids],
+            self.offsets, foot_radius, foot_half_width,
+        )
+        # Accessing data ensures the lazy ray caster has initialized its mesh.
+        _ = self.scanner.data
+        mesh = RayCaster.meshes[self.scanner.cfg.mesh_prim_paths[0]]
+        command = env.command_manager.get_command(command_name)[:, :2]
+        yaw = data.heading_w
+        direction = torch.stack((
+            yaw.cos() * command[:, 0] - yaw.sin() * command[:, 1],
+            yaw.sin() * command[:, 0] + yaw.cos() * command[:, 1],
+        ), dim=-1)
+        direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        # Probe the sole footprint and the next edge in the commanded direction.
+        # At swing boundaries lookahead fades out, allowing normal touchdown.
+        offsets = center.new_tensor(((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)))
+        offsets *= terrain_sample_radius
+        starts = center.unsqueeze(-2).expand(-1, -1, 6, -1).clone()
+        starts[..., :2] += offsets
+        starts[:, :, -1, :2] += (
+            direction[:, None, :] * lookahead_distance * torch.sin(torch.pi * progress).unsqueeze(-1)
+        )
+        starts[..., 2] += 0.5
+        directions = torch.zeros_like(starts)
+        directions[..., 2] = -1.0
+        hits, _, normals, _ = raycast_mesh(starts, directions, mesh=mesh, max_dist=2.0, return_normal=True)
+        valid_samples = torch.isfinite(hits).all(dim=-1) & torch.isfinite(normals).all(dim=-1)
+        valid_samples &= normals[..., 2].abs() >= 0.5
+        valid = valid_samples.all(dim=-1)
+        ground = torch.where(valid_samples, hits[..., 2], 0.0).max(dim=-1).values
+        clearance = center[..., 2] - extent - ground
+        return swing_clearance_error(clearance, progress, swing, valid, clock.active, height, std, deficit_only)
+
+
+class StairLandingPenalty(SwingClearancePenalty):
+    """Penalize supporting a foot across a step edge, using a sole footprint proxy."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self.contact_ids = cfg.params["sensor_cfg"].body_ids
+
+    def __call__(self, env, asset_cfg, terrain_sensor_cfg, command_name, foot_offsets,
+                 sensor_cfg, foot_radius: float, foot_half_width: float, edge_tolerance: float):
+        data = self.asset.data
+        center, _ = foot_geometry(
+            data.body_link_pos_w[:, self.body_ids], data.body_link_quat_w[:, self.body_ids],
+            self.offsets, foot_radius, foot_half_width,
+        )
+        offsets = center.new_tensor(((0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)))
+        starts = center.unsqueeze(-2) + offsets * foot_radius
+        starts[..., 2] += 0.5
+        directions = torch.zeros_like(starts)
+        directions[..., 2] = -1.0
+        _ = self.scanner.data
+        mesh = RayCaster.meshes[self.scanner.cfg.mesh_prim_paths[0]]
+        hits, _, _, _ = raycast_mesh(starts, directions, mesh=mesh, max_dist=2.0)
+        valid = torch.isfinite(hits).all(dim=-1).all(dim=-1)
+        heights = torch.where(torch.isfinite(hits[..., 2]), hits[..., 2], 0.0)
+        spread = heights.max(dim=-1).values - heights.min(dim=-1).values
+        edge = ((spread - edge_tolerance) / edge_tolerance).clamp(0.0, 1.0)
+        contact = self.sensor.data.current_contact_time[:, self.contact_ids] > 0.0
+        active = env.command_manager.get_term(command_name).gait_clock.active
+        return (edge * contact * valid).mean(dim=-1) * active
+
+
+def standing_support(
+    env, command_name: str, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg, foot_offsets,
+) -> torch.Tensor:
+    """Reward sustained quiet support, never the number of touchdown events."""
+    clock = env.command_manager.get_term(command_name).gait_clock
+    asset = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_cfg.name]
+    contact = (sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0.0).float().mean(dim=-1)
+    data = asset.data
+    offsets = data.root_pos_w.new_tensor(foot_offsets)
+    center, _ = foot_geometry(
+        data.body_link_pos_w[:, asset_cfg.body_ids], data.body_link_quat_w[:, asset_cfg.body_ids], offsets, 0.0, 0.0
+    )
+    lever = center - data.body_link_pos_w[:, asset_cfg.body_ids]
+    foot_velocity = data.body_link_lin_vel_w[:, asset_cfg.body_ids] + torch.cross(
+        data.body_link_ang_vel_w[:, asset_cfg.body_ids], lever, dim=-1
+    )
+    body_motion = data.root_lin_vel_b.square().sum(dim=-1) / 0.1**2
+    body_motion += data.root_ang_vel_b.square().sum(dim=-1) / 0.2**2
+    foot_motion = foot_velocity.square().sum(dim=-1).mean(dim=-1) / 0.1**2
+    action_change = (env.action_manager.action - env.action_manager.prev_action).square().mean(dim=-1) / 0.1**2
+    upright = (-data.projected_gravity_b[:, 2]).clamp(0.0, 1.0)
+    return contact * torch.exp(-body_motion - foot_motion - action_change) * upright * ~clock.active
+
+
+def standing_joint_motion(env, command_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    clock = env.command_manager.get_term(command_name).gait_clock
+    joint_velocity = env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids]
+    action_delta = env.action_manager.action - env.action_manager.prev_action
+    return standing_motion_error(joint_velocity, action_delta, clock.active)
+
+
+def standing_yaw_drift(
+    env, command_name: str, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize yaw drift after stopping, without restricting commanded turns."""
+    clock = env.command_manager.get_term(command_name).gait_clock
+    yaw_rate = env.scene[asset_cfg.name].data.root_ang_vel_b[:, 2]
+    return (yaw_rate / std).square().clamp(max=9.0) * ~clock.active
+
+
+def gait_foot_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg, foot_offsets) -> torch.Tensor:
+    """Horizontal slip at fixed foot centers, rather than calf link origins."""
+    data = env.scene[asset_cfg.name].data
+    center, _ = foot_geometry(
+        data.body_link_pos_w[:, asset_cfg.body_ids], data.body_link_quat_w[:, asset_cfg.body_ids],
+        data.root_pos_w.new_tensor(foot_offsets), 0.0, 0.0,
+    )
+    velocity = data.body_link_lin_vel_w[:, asset_cfg.body_ids] + torch.cross(
+        data.body_link_ang_vel_w[:, asset_cfg.body_ids], center - data.body_link_pos_w[:, asset_cfg.body_ids], dim=-1
+    )
+    contact = env.scene.sensors[sensor_cfg.name].data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    return ((velocity[..., :2].square().sum(dim=-1) / 0.2**2).clamp(max=4.0) * contact).mean(dim=-1)
 
 
 class PeriodicFootLiftReward(ManagerTermBase):

@@ -5,10 +5,11 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
-from .periodic_gait import configure_body_height_reward, configure_periodic_gait
+from .periodic_gait import configure_gait_rewards, configure_periodic_gait
 from .stairs_terrain import ATDog2StairsTerrainGeneratorCfg
 
 ##
@@ -20,7 +21,7 @@ from .stairs_terrain import ATDog2StairsTerrainGeneratorCfg
 from robot_lab.assets.atdog import AT_DOG2_CFG  # isort: skip
 
 # 自定义台阶地形（倒金字塔上台阶）:
-# - 台阶高 10cm
+# - 台阶高 4–6cm（本轮保持难度不变）
 # - 台阶水平长度 30cm
 # 说明:
 # 使用 MeshInvertedPyramidStairsTerrainCfg（与 Isaac Lab 默认 rough 配置一致）
@@ -41,7 +42,7 @@ DOG2_STAIRS_TERRAIN_CFG = ATDog2StairsTerrainGeneratorCfg(
         "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0),
         "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.06, 0.08),#(最初0.07-0.13)
+            step_height_range=(0.04, 0.06),#(最初0.07-0.13)
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -49,7 +50,7 @@ DOG2_STAIRS_TERRAIN_CFG = ATDog2StairsTerrainGeneratorCfg(
         ),
         "stairs2": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.06, 0.08),
+            step_height_range=(0.04, 0.06),
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -264,7 +265,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
         self.rewards.undesired_contacts.weight = -20.0
-        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{self.foot_link_name}).*"]
+        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [
+            self.base_link_name, ".*_hip", ".*_thigh"
+        ]
         # 足端接触力惩罚，避免落脚冲击过大。
         # 过大可能导致“轻触地”倾向，影响抓地与推进效率。
         self.rewards.contact_forces.weight = -1.5e-4
@@ -278,46 +281,12 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.track_ang_vel_z_exp.weight = 40.0
 
         # Others
-        # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚。
-        self.rewards.feet_air_time.weight = 5.0
-        # 只在腾空时间超过阈值时开始计入（单位 s），避免“微小离地”刷分。
-        self.rewards.feet_air_time.params["threshold"] = 0.25
-        self.rewards.feet_air_time.params["sensor_cfg"].body_names = [self.foot_link_name]
-        # 腾空时间方差惩罚: 抑制四腿步态节律差异过大，提升步态均匀性。
-        self.rewards.feet_air_time_variance.weight = -6.0
-        self.rewards.feet_air_time_variance.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 足接触奖励（可用于鼓励稳定支撑），当前关闭。
         self.rewards.feet_contact.weight = 0
         self.rewards.feet_contact.params["sensor_cfg"].body_names = [self.foot_link_name]
-        # 无速度命令时的足接触奖励: 鼓励静止时脚不乱抬，站姿更稳。
-        self.rewards.feet_contact_without_cmd.weight = 2.0
-        self.rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 绊脚/碰撞惩罚，当前关闭（可按地形难度逐步启用）。
-        self.rewards.feet_stumble.weight = 1.0
+        self.rewards.feet_stumble.weight = -1.0
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
-        # 足端滑动惩罚: 脚着地后相对地面滑移越大，惩罚越大。
-        self.rewards.feet_slide.weight = -2.0
-        self.rewards.feet_slide.params["sensor_cfg"].body_names = [self.foot_link_name]
-        self.rewards.feet_slide.params["asset_cfg"].body_names = [self.foot_link_name]
-        # 足端绝对高度目标项（常用于抬脚高度约束），当前关闭。
-        self.rewards.feet_height.weight = -30.0
-        self.rewards.feet_height.params["target_height"] = 0.13
-        self.rewards.feet_height.params["asset_cfg"].body_names = [self.foot_link_name]
-        # 相对机身的足端高度惩罚（body frame），约束抬腿轨迹不过高/不过低。
-        # target_height=-0.2 表示期望脚位于机身下方一定距离处。
-        self.rewards.feet_height_body.weight = -30.0
-        self.rewards.feet_height_body.params["target_height"] = -0.20
-        self.rewards.feet_height_body.params["asset_cfg"].body_names = [self.foot_link_name]
-        configure_body_height_reward(self)
-        # 抬脚奖励仅在沿平移命令实际推进时给满分。
-        self.rewards.periodic_foot_lift.params["progress_weighted"] = True
-        self.rewards.periodic_foot_lift.params["phase_from_command"] = True
-        # 步态同步奖励: 鼓励对角腿成对同步（trot 风格）。
-        self.rewards.feet_gait.weight = 12.0
-        self.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_calf", "RR_calf"), ("FR_calf", "RL_calf"))
-        # 当前接触模式约束: 只在有速度命令时启用，抑制 pacing/bounding/四脚跳导致的机身上下弹跳。
-        self.rewards.diagonal_trot_contact_pattern.weight = -1.0
-        self.rewards.diagonal_trot_contact_pattern.params["foot_names"] = ("FL_calf", "FR_calf", "RL_calf", "RR_calf")
         # 机身“向上”姿态奖励（保持重力反方向对齐），提升整体直立稳定性。
         self.rewards.upward.weight = 0.0
 
@@ -325,6 +294,32 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_distance_y_exp.params["stance_width"] = 0.16
         self.rewards.feet_distance_y_exp.params["std"] = 0.15
         self.rewards.feet_distance_y_exp.params["asset_cfg"].body_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
+
+        configure_gait_rewards(self, swing_height=0.12)
+        # 台阶接触允许更宽的触地过渡；加强摆腿，而非硬性提高接触惩罚。
+        self.rewards.gait_contact.weight = -7.5
+        self.rewards.swing_clearance.weight = -15.0
+        self.rewards.swing_clearance.params.update(
+            std=0.06, terrain_sample_radius=0.0384,
+            lookahead_distance=0.08, deficit_only=True,
+        )
+        self.rewards.stair_landing = RewTerm(
+            func=mdp.StairLandingPenalty,
+            weight=-3.0,
+            params={
+                "asset_cfg": self.rewards.swing_clearance.params["asset_cfg"],
+                "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=["FL_calf", "FR_calf", "RL_calf", "RR_calf"],
+                    preserve_order=True,
+                ),
+                "command_name": "base_velocity",
+                "foot_offsets": self.rewards.swing_clearance.params["foot_offsets"],
+                "foot_radius": 0.0384,
+                "foot_half_width": 0.014,
+                "edge_tolerance": 0.015,
+            },
+        )
 
         # 将权重为0的奖励项禁用，减少无效计算与配置噪声
         if self.__class__.__name__ == "ATDogDog2StairsEnvCfg":
@@ -357,6 +352,5 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
             min_command_speed=0.2,
             success_distance=2.1,
             min_height_change=0.06,
-            cycle_time=0.5,
-            stop_duration=0.5,
         )
+        self.commands.base_velocity.gait.transition_width = 0.08

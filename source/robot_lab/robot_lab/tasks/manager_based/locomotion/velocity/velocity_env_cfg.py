@@ -688,6 +688,12 @@ class RewardsCfg:
     hip_outward_deviation_l1 = None
     periodic_foot_lift = None
     feet_height_body_exp = None
+    gait_contact = None
+    swing_clearance = None
+    stair_landing = None
+    standing_support = None
+    standing_joint_motion = None
+    standing_yaw_drift = None
 
 
 @configclass

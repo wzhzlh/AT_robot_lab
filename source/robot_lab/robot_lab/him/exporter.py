@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import os
+import shutil
 
 import torch
 import torch.nn.functional as F
@@ -124,12 +126,18 @@ def _build_him_deployment_metadata(actor_critic, env) -> dict[str, object]:
             "num_observations": int(env_metadata["one_step_obs_dim"]),
             "policy_input_dim": int(env_metadata["actor_obs_dim"]),
             "observations": mapped_terms,
-            "observations_history": list(range(int(env_metadata["history_length"]))),
+            "observations_history": (
+                list(range(int(env_metadata["history_length"]) - 1, -1, -1))
+                if env_metadata.get("history_order") == "oldest_to_latest"
+                else list(range(int(env_metadata["history_length"])))
+            ),
             "observations_history_priority": "time",
-            "history_layout": "time_major_current_to_oldest",
+            "history_layout": env_metadata["history_layout"],
         }
         if "gait_cycle_time" in env_metadata:
             metadata["recommended_at_robot_lab_history"]["cycle_time"] = env_metadata["gait_cycle_time"]
+        if "gait_clock" in env_metadata:
+            metadata["recommended_at_robot_lab_history"]["gait_clock"] = env_metadata["gait_clock"]
     return metadata
 
 
@@ -143,6 +151,13 @@ def export_him_deployment_metadata(
     os.makedirs(path, exist_ok=True)
 
     metadata = _build_him_deployment_metadata(actor_critic, env)
+    gait_clock_path = None
+    if "gait_clock" in metadata:
+        from robot_lab.gait import TrotClock
+
+        gait_clock_path = os.path.join(path, "gait_clock.py")
+        shutil.copyfile(inspect.getfile(TrotClock), gait_clock_path)
+        metadata["gait_clock"]["implementation_file"] = "gait_clock.py"
     metadata_path = os.path.join(path, metadata_filename)
     with open(metadata_path, "w", encoding="ascii") as file:
         json.dump(metadata, file, indent=2, sort_keys=False)
@@ -164,10 +179,14 @@ def export_him_deployment_metadata(
         ]
         if "cycle_time" in recommended:
             lines.append(f"cycle_time: {recommended['cycle_time']}")
+        if "gait_clock" in recommended:
+            lines.append("# Use gait_clock.py:TrotClock with these parameters; an episode-time sine is incompatible.")
+            lines.append(f"gait_clock: {json.dumps(recommended['gait_clock'])}")
         with open(at_robot_lab_path, "w", encoding="ascii") as file:
             file.write("\n".join(lines) + "\n")
 
     return {
         "metadata_path": metadata_path,
         "at_robot_lab_path": at_robot_lab_path,
+        "gait_clock_path": gait_clock_path,
     }

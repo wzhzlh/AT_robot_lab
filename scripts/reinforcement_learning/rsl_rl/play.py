@@ -41,7 +41,15 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-parser.add_argument("--keyboard", action="store_true", default=False, help="Whether to use keyboard.")
+command_group = parser.add_mutually_exclusive_group()
+command_group.add_argument("--keyboard", action="store_true", default=False, help="Whether to use keyboard.")
+command_group.add_argument(
+    "--zero_commmand",
+    "--zero_command",
+    dest="zero_command",
+    action="store_true",
+    help="Keep all base velocity commands at zero during play.",
+)
 parser.add_argument("--him_allow_legacy_checkpoint", action="store_true", help="Explicitly load a HIM checkpoint without an observation contract.")
 parser.add_argument(
     "--export_only",
@@ -152,6 +160,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.events.randomize_apply_external_force_torque = None
     env_cfg.events.push_robot = None
     env_cfg.curriculum.command_levels = None
+
+    if args_cli.zero_command:
+        command_cfg = env_cfg.commands.base_velocity
+        command_cfg.ranges.lin_vel_x = (0.0, 0.0)
+        command_cfg.ranges.lin_vel_y = (0.0, 0.0)
+        command_cfg.ranges.ang_vel_z = (0.0, 0.0)
+        command_cfg.heading_command = False
+        command_cfg.rel_standing_envs = 1.0
 
     if args_cli.keyboard:
         env_cfg.scene.num_envs = 1

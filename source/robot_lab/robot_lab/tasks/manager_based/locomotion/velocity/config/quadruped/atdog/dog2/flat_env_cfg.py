@@ -4,9 +4,12 @@
 import isaaclab.terrains as terrain_gen
 from isaaclab.utils import configclass
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import RewardTermCfg as RewTerm
+
+import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
 
 from .rough_env_cfg import ATDogDog2RoughEnvCfg
-from .periodic_gait import configure_body_height_reward, configure_periodic_foot_lift_reward
+from .periodic_gait import configure_gait_rewards
 
 
 ATDOG2_LOW_OBSTACLE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
@@ -36,6 +39,8 @@ class ATDogDog2FlatEnvCfg(ATDogDog2RoughEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
+        # Short flat episodes: 250 control steps at 50 Hz.
+        self.episode_length_s = 5.0
 
         # Keep flat-task resets very close to the nominal standing state.
         # Small pose perturbations help robustness without spawning the robot
@@ -66,11 +71,13 @@ class ATDogDog2FlatEnvCfg(ATDogDog2RoughEnvCfg):
         self.observations.policy.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None
-        # Keep the command-driven gait phase useful before the stair stage.
-        configure_periodic_foot_lift_reward(self)
-        self.rewards.periodic_foot_lift.weight = 10.0
-        configure_body_height_reward(self)
-        self.rewards.feet_height_body_exp.weight = 20.0
+        configure_gait_rewards(self, swing_height=0.07)
+        self.rewards.standing_support.weight = 6.0
+        self.rewards.standing_yaw_drift = RewTerm(
+            func=mdp.standing_yaw_drift,
+            weight=-4.0,
+            params={"command_name": "base_velocity", "std": 0.15},
+        )
 
         # If the weight of rewards is 0, set rewards to None
         if self.__class__.__name__ == "ATDogDog2FlatEnvCfg":
@@ -102,6 +109,6 @@ class ATDogDog2FlatDomainRandEnvCfg(ATDogDog2FlatEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (-0.8, 1.2)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.6, 0.6)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
-        self.rewards.periodic_foot_lift.weight = 25.0
-        self.rewards.feet_height_body_exp.weight = 50.0
+        configure_gait_rewards(self, swing_height=0.08)
+        self.rewards.standing_support.weight = 6.0
         self.disable_zero_weight_rewards()

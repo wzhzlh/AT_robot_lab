@@ -280,9 +280,15 @@ class HIMVecEnvWrapper:
         if "phase" in self.policy_term_names:
             manager = self.unwrapped.observation_manager
             phase_index = manager._group_obs_term_names["policy"].index("phase")
-            metadata["gait_cycle_time"] = float(
-                manager._group_obs_term_cfgs["policy"][phase_index].params["cycle_time"]
-            )
+            params = manager._group_obs_term_cfgs["policy"][phase_index].params
+            if "command_name" in params:
+                term = self.unwrapped.command_manager.get_term(params["command_name"])
+                metadata["gait_clock"] = term.gait_clock.metadata()
+                metadata["gait_clock"]["control_dt"] = float(self.unwrapped.step_dt)
+                metadata["gait_cycle_time"] = term.gait_clock.cfg.cycle_time
+            else:
+                # Older tasks may still use the episode-time phase function.
+                metadata["gait_cycle_time"] = float(params["cycle_time"])
         return metadata
 
     @staticmethod
