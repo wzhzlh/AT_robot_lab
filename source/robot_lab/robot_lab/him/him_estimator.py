@@ -102,7 +102,8 @@ class HIMEstimator(nn.Module):
         lr: float | None = None,
         velocity_loss_coef: float = 1.0,
         swap_loss_coef: float = 1.0,
-    ) -> tuple[float, float]:
+        return_tensors: bool = False,
+    ) -> tuple[float, float] | tuple[torch.Tensor, torch.Tensor]:
         if lr is not None and lr != self.learning_rate:
             self.learning_rate = lr
             for param_group in self.optimizer.param_groups:
@@ -113,6 +114,9 @@ class HIMEstimator(nn.Module):
         else:
             valid_mask = valid_mask.view(-1).bool()
         if not torch.any(valid_mask):
+            if return_tensors:
+                zero = obs_history.new_zeros(())
+                return zero, zero
             return 0.0, 0.0
 
         obs_history = obs_history[valid_mask]
@@ -154,4 +158,6 @@ class HIMEstimator(nn.Module):
         nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
+        if return_tensors:
+            return estimation_loss.detach(), swap_loss.detach()
         return float(estimation_loss.item()), float(swap_loss.item())

@@ -1,0 +1,41 @@
+"""Check device-side log snapshots and one batched aggregation."""
+import ast
+from collections import deque
+from pathlib import Path
+import unittest
+
+import torch
+
+path = Path(__file__).resolve().parents[1] / 'source/robot_lab/robot_lab/him/him_on_policy_runner.py'
+tree = ast.parse(path.read_text())
+namespace = dict(torch=torch, deque=deque)
+exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.ClassDef)], type_ignores=[]), str(path), 'exec'), namespace)
+Runner = namespace['HIMOnPolicyRunner']
+
+
+class EpisodeLogTransferTests(unittest.TestCase):
+    def check_device(self, device):
+        runner = Runner.__new__(Runner)
+        original = torch.tensor([1., 3.], device=device)
+        logs = []
+        runner._append_episode_log(logs, {'log': {
+            'Episode_Reward/test': original, 'Metrics/test': 2.,
+            'Running/ignored': 100.,
+        }})
+        self.assertEqual(logs[0]['Episode_Reward/test'].device, original.device)
+        original.fill_(100.)
+        logs.append({'Episode_Reward/test': torch.tensor(5.), 'Metrics/test': 4.})
+        self.assertEqual(dict(runner._aggregate_episode_infos(logs)), {
+            'Episode_Reward/test': 3., 'Metrics/test': 3.,
+        })
+
+    def test_cpu(self):
+        self.check_device('cpu')
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
+    def test_cuda_with_mixed_cpu_scalars(self):
+        self.check_device('cuda:0')
+
+
+if __name__ == '__main__':
+    unittest.main()

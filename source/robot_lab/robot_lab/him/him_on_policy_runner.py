@@ -35,7 +35,18 @@ class HIMOnPolicyRunner:
                 f"configured={configured_history}, actual={self.env.history_length}."
             )
         self.policy_cfg.pop("num_one_step_obs", None)
-        self.policy_cfg.pop("history_order", None)
+        configured_order = self.policy_cfg.pop("history_order", None)
+        live_order = getattr(self.env, "history_order", None)
+        if configured_order is not None and live_order is not None and configured_order != live_order:
+            raise ValueError("HIM policy history_order differs from the live wrapper history_order.")
+        expected_frame = {"oldest_to_latest": "last", "latest_to_oldest": "first"}.get(live_order)
+        if expected_frame and self.policy_cfg.get("actor_current_frame", "first") != expected_frame:
+            raise ValueError(f"HIM actor_current_frame must be {expected_frame!r} for history_order={live_order!r}.")
+        # This runner uses fixed observation-manager scaling, not running statistics.
+        # Reject unsupported flags instead of silently ignoring normalization requests.
+        if (train_cfg.get("empirical_normalization") or
+                self.policy_cfg.get("actor_obs_normalization") or self.policy_cfg.get("critic_obs_normalization")):
+            raise ValueError("HIM running observation normalization is unsupported; use fixed observation term scales.")
         self.policy_cfg.pop("estimator_target_term_names", None)
         if self.env.num_privileged_obs is None:
             raise ValueError(
@@ -75,7 +86,10 @@ class HIMOnPolicyRunner:
         self.latest_episode_metrics: dict[str, float] = {}
         self.latest_mean_reward: float | None = None
         self.latest_mean_episode_length: float | None = None
-        self.episode_metric_history: deque[dict[str, torch.Tensor | float | int]] = deque(maxlen=100)
+        # Each window entry stores (sum, count) per metric key, so the running
+        # average costs O(keys) per iteration instead of O(batches * keys).
+        self.episode_metric_window: deque[dict[str, tuple[float, int]]] = deque(maxlen=100)
+        self._episode_metric_totals: dict[str, list[float]] = {}
 
         _, reset_infos = self.env.reset()
         self._update_episode_metric_cache(self._extract_log_dict(reset_infos))
@@ -132,6 +146,7 @@ class HIMOnPolicyRunner:
     def save(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = {
+            "checkpoint_format_version": 2,
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "estimator_optimizer_state_dict": self.alg.actor_critic.estimator.optimizer.state_dict(),
@@ -140,6 +155,7 @@ class HIMOnPolicyRunner:
                 "num_one_step_obs": self.alg.actor_critic.num_one_step_obs,
                 "vel_slice": self.alg.actor_critic.vel_slice,
                 "target_slices": self.alg.actor_critic.target_slices,
+                "actor_current_frame": getattr(self.alg.actor_critic, "actor_current_frame", None),
             },
             "observation_contract": self.env.get_observation_contract(),
         }
@@ -155,7 +171,15 @@ class HIMOnPolicyRunner:
     ):
         loaded_dict = torch.load(path, map_location=self.device)
         contract = loaded_dict.get("observation_contract")
-        critic_height_scan_expanded = False
+        saved_frame = (loaded_dict.get("infos") or {}).get("actor_current_frame")
+        if saved_frame is None and contract is not None:
+            saved_frame = {"time_major_oldest_to_current": "last", "time_major_current_to_oldest": "first"}.get(
+                contract.get("history_layout")
+            )
+        live_frame = getattr(self.alg.actor_critic, "actor_current_frame", None)
+        if saved_frame is not None and live_frame is not None and saved_frame != live_frame:
+            raise ValueError(f"HIM checkpoint actor_current_frame={saved_frame!r} differs from model={live_frame!r}.")
+        critic_input_migrated = False
         observation_migrated = False
         if contract is None and not allow_legacy:
             raise ValueError("HIM checkpoint has no observation contract; explicit allow_legacy=True is required.")
@@ -169,12 +193,27 @@ class HIMOnPolicyRunner:
                 for candidate in (saved_contract, current_contract):
                     self._relax_inference_contract(candidate)
             differences = self._contract_differences(saved_contract, current_contract)
-            critic_height_scan_expanded = self._is_critic_height_scan_append(saved_contract, current_contract)
-            if critic_height_scan_expanded:
-                differences = []
-            elif differences and allow_observation_migration and not inference:
+            if differences and allow_observation_migration and not inference:
                 observation_migrated = self._is_atdog2_observation_migration(saved_contract, current_contract)
                 if observation_migrated:
+                    differences = []
+                else:
+                    # Recognize a phase/noise migration even when critic inputs
+                    # also changed. Preserve the explicit opt-in for policy semantics.
+                    candidate = copy.deepcopy(current_contract)
+                    new_by_name = {term["name"]: term for term in current_contract["groups"]["critic"]}
+                    candidate["groups"]["critic"] = [
+                        copy.deepcopy(new_by_name.get(term["name"], term))
+                        for term in saved_contract["groups"]["critic"]
+                    ]
+                    candidate["teacher_target_slices"] = saved_contract.get("teacher_target_slices")
+                    candidate["velocity_slice"] = saved_contract.get("velocity_slice")
+                    if self._is_atdog2_observation_migration(saved_contract, candidate):
+                        saved_contract = candidate
+                        observation_migrated = True
+            if differences:
+                critic_input_migrated = self._can_migrate_critic_inputs(saved_contract, current_contract)
+                if critic_input_migrated:
                     differences = []
             if differences:
                 details = "\n".join(f"  - {difference}" for difference in differences[:20])
@@ -187,21 +226,24 @@ class HIMOnPolicyRunner:
                     "--him_allow_legacy_checkpoint only applies to checkpoints without a contract."
                 )
         model_state = loaded_dict["model_state_dict"]
-        if critic_height_scan_expanded:
-            model_state = self._expand_critic_height_scan_weights(model_state)
+        if critic_input_migrated:
+            model_state = self._migrate_critic_input_weights(model_state, saved_contract, current_contract)
             print(
-                "[WARN] Resuming HIM checkpoint with critic height_scan added: "
-                "copied existing critic weights and zero-initialized the new height_scan input weights. "
-                "The PPO optimizer state starts fresh."
+                "[WARN] HIM critic input layout changed: matched input columns by observation name/definition; "
+                "removed columns discarded, new/changed inputs zero-initialized. "
+                "PPO optimizer starts fresh; saved iteration retained. Value estimates must readapt."
             )
+        if critic_input_migrated or observation_migrated:
+            self.alg.optimizer.state.clear()
         if observation_migrated:
+            self.alg.actor_critic.estimator.optimizer.state.clear()
             print(
                 "[WARN] Warm-starting HIM from the previous ATDog2 observation semantics: "
                 "the actor/critic weights are retained, while PPO and estimator optimizer states start fresh. "
                 "The saved iteration count is retained."
             )
         self.alg.actor_critic.load_state_dict(model_state, strict=True)
-        if "optimizer_state_dict" in loaded_dict and not critic_height_scan_expanded and not observation_migrated and not weights_only:
+        if "optimizer_state_dict" in loaded_dict and not critic_input_migrated and not observation_migrated and not weights_only:
             try:
                 self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             except (RuntimeError, ValueError):
@@ -255,63 +297,67 @@ class HIMOnPolicyRunner:
         return not cls._contract_differences(previous, updated)
 
     @classmethod
-    def _is_critic_height_scan_append(cls, saved: dict, current: dict) -> bool:
-        saved_groups = saved.get("groups")
-        current_groups = current.get("groups")
-        if not isinstance(saved_groups, dict) or not isinstance(current_groups, dict):
-            return False
-        saved_critic = saved_groups.get("critic")
-        current_critic = current_groups.get("critic")
-        if not isinstance(saved_critic, list) or not isinstance(current_critic, list):
-            return False
-        if len(current_critic) != len(saved_critic) + 1:
-            return False
-        if not isinstance(current_critic[-1], dict) or current_critic[-1].get("name") != "height_scan":
+    def _can_migrate_critic_inputs(cls, saved: dict, current: dict) -> bool:
+        """Allow only critic layout changes; actor and teacher semantics stay fixed."""
+        try:
+            previous, updated = copy.deepcopy(saved), copy.deepcopy(current)
+            old_terms = previous["groups"].pop("critic")
+            new_terms = updated["groups"].pop("critic")
+            old = cls._critic_term_layout(old_terms)
+            new = cls._critic_term_layout(new_terms)
+            # Teacher fields drive estimator training and cannot silently change.
+            required = ["base_lin_vel", *saved.get("teacher_target_terms", [])]
+            for name in required:
+                if name not in old or name not in new or old[name][2] != new[name][2]:
+                    return False
+            # Offsets may change, but must actually refer to the declared fields.
+            for contract, layout in ((previous, old), (updated, new)):
+                if contract.get("velocity_slice") != list(layout["base_lin_vel"][:2]):
+                    return False
+                expected = [list(layout[name][:2]) for name in contract["teacher_target_terms"]]
+                if contract.get("teacher_target_slices") != expected:
+                    return False
+                contract.pop("velocity_slice")
+                contract.pop("teacher_target_slices")
+            return not cls._contract_differences(previous, updated)
+        except (KeyError, TypeError, ValueError):
             return False
 
-        comparable_current = copy.deepcopy(current)
-        comparable_current["groups"]["critic"] = comparable_current["groups"]["critic"][:-1]
-        return not cls._contract_differences(saved, comparable_current)
+    @staticmethod
+    def _critic_term_layout(terms):
+        layout = {}
+        offset = 0
+        for term in terms:
+            name, dim = term["name"], term["dim"]
+            if name in layout or not isinstance(dim, int) or dim <= 0:
+                raise ValueError("Critic terms must have unique names and positive dimensions")
+            layout[name] = (offset, offset + dim, term)
+            offset += dim
+        return layout
 
-    def _expand_critic_height_scan_weights(self, checkpoint_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _migrate_critic_input_weights(self, checkpoint_state, saved, current):
+        old = self._critic_term_layout(saved["groups"]["critic"])
+        new = self._critic_term_layout(current["groups"]["critic"])
         current_state = self.alg.actor_critic.state_dict()
-        adapted_state = dict(current_state)
-        mismatches = []
-        expanded_keys = []
-
-        for key, saved_value in checkpoint_state.items():
-            if key not in current_state:
-                mismatches.append(f"unexpected checkpoint parameter {key}")
-                continue
-            current_value = current_state[key]
-            if saved_value.shape == current_value.shape:
-                adapted_state[key] = saved_value
-            elif (
-                key.startswith("critic.")
-                and key.endswith(".weight")
-                and saved_value.ndim == 2
-                and current_value.ndim == 2
-                and saved_value.shape[0] == current_value.shape[0]
-                and saved_value.shape[1] < current_value.shape[1]
-            ):
-                expanded = torch.zeros_like(current_value)
-                expanded[:, : saved_value.shape[1]].copy_(saved_value)
-                adapted_state[key] = expanded
-                expanded_keys.append(key)
-            else:
-                mismatches.append(
-                    f"{key}: checkpoint shape={tuple(saved_value.shape)}, "
-                    f"current shape={tuple(current_value.shape)}"
-                )
-
-        missing_keys = set(current_state) - set(checkpoint_state)
-        if missing_keys:
-            mismatches.extend(f"missing checkpoint parameter {key}" for key in sorted(missing_keys))
-        if mismatches or len(expanded_keys) != 1:
-            details = "; ".join(mismatches or [f"expected one expanded critic weight, found {expanded_keys}"])
-            raise ValueError(f"Cannot safely expand HIM critic for height_scan: {details}")
-        return adapted_state
-
+        if set(checkpoint_state) != set(current_state):
+            raise ValueError("Cannot migrate checkpoint with missing/unexpected model parameters")
+        key = "critic.0.weight"
+        source, target = checkpoint_state[key], current_state[key]
+        old_width = sum(stop - start for start, stop, _ in old.values())
+        new_width = sum(stop - start for start, stop, _ in new.values())
+        if source.shape != (target.shape[0], old_width) or target.shape[1] != new_width:
+            raise ValueError("Critic first layer does not match checkpoint/current observation contracts")
+        adapted = dict(checkpoint_state)
+        for name, value in checkpoint_state.items():
+            if name != key and value.shape != current_state[name].shape:
+                raise ValueError(f"Cannot migrate non-input parameter {name}: {value.shape} -> {current_state[name].shape}")
+        weight = torch.zeros_like(target)
+        for name, (start, stop, descriptor) in new.items():
+            if name in old and old[name][2] == descriptor:
+                old_start, old_stop, _ = old[name]
+                weight[:, start:stop] = source[:, old_start:old_stop]
+        adapted[key] = weight
+        return adapted
 
     @staticmethod
     def _relax_inference_contract(contract: dict):
@@ -394,17 +440,35 @@ class HIMOnPolicyRunner:
         ep_infos = []
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        # Finished-episode bookkeeping is accumulated on the device and moved to the
+        # host once per iteration; per-step masked selects would sync the stream.
+        episode_done = torch.zeros(
+            (self.num_steps_per_env, self.env.num_envs), dtype=torch.bool, device=self.device
+        )
+        episode_reward = torch.zeros(
+            (self.num_steps_per_env, self.env.num_envs), dtype=torch.float, device=self.device
+        )
+        episode_length = torch.zeros_like(episode_reward)
+        timer = _SectionTimer(self.device)
+        # Kept across iterations so a stale extras["log"] is not logged twice.
+        last_log = None
 
         tot_iter = self.current_learning_iteration + num_learning_iterations
         for iteration in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             episodes_completed = 0
+            timer.reset()
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for step in range(self.num_steps_per_env):
                     if self.observation_logger is not None:
                         self.observation_logger.record(obs)
+                    timer.start("act")
                     actions = self.alg.act(obs, critic_obs)
+                    timer.stop("act")
+                    timer.start("env")
                     obs, rewards, dones, infos = self.env.step(actions)
+                    timer.stop("env")
+                    timer.start("post")
                     obs = obs.to(self.device)
                     critic_obs = self._get_critic_observations().to(self.device)
                     rewards = rewards.to(self.device)
@@ -416,15 +480,25 @@ class HIMOnPolicyRunner:
 
                     cur_reward_sum += rewards.view(-1)
                     cur_episode_length += 1
-                    done_ids = (dones > 0).nonzero(as_tuple=False).flatten()
-                    if done_ids.numel() > 0:
-                        episodes_completed += done_ids.numel()
-                        rewbuffer.extend(cur_reward_sum[done_ids].detach().cpu().tolist())
-                        lenbuffer.extend(cur_episode_length[done_ids].detach().cpu().tolist())
+                    done_mask = dones.view(-1) > 0
+                    episode_done[step].copy_(done_mask)
+                    torch.where(done_mask, cur_reward_sum, torch.zeros_like(cur_reward_sum), out=episode_reward[step])
+                    torch.where(done_mask, cur_episode_length, torch.zeros_like(cur_episode_length), out=episode_length[step])
+                    cur_reward_sum.masked_fill_(done_mask, 0.0)
+                    cur_episode_length.masked_fill_(done_mask, 0.0)
+                    # A reset replaces extras["log"] with a fresh dictionary, so object
+                    # identity reports "episodes finished this step" without a sync.
+                    log_dict = infos.get("log") if isinstance(infos, dict) else None
+                    if log_dict is not None and log_dict is not last_log:
+                        last_log = log_dict
                         self._append_episode_log(ep_infos, infos)
-                        cur_reward_sum[done_ids] = 0
-                        cur_episode_length[done_ids] = 0
+                    timer.stop("post")
 
+                completed_mask = episode_done.cpu()
+                episodes_completed = int(completed_mask.sum())
+                if episodes_completed:
+                    rewbuffer.extend(episode_reward.cpu()[completed_mask].tolist())
+                    lenbuffer.extend(episode_length.cpu()[completed_mask].tolist())
                 collection_time = time.time() - start
                 learn_start = time.time()
                 self.alg.compute_returns(critic_obs)
@@ -452,8 +526,11 @@ class HIMOnPolicyRunner:
                 lenbuffer,
                 ep_infos,
                 episodes_completed,
-                float(cur_reward_sum.mean().item()),
-                float(cur_episode_length.mean().item()),
+                float(cur_reward_sum.mean().item())
+                if not rewbuffer and self.latest_mean_reward is None else 0.0,
+                float(cur_episode_length.mean().item())
+                if not lenbuffer and self.latest_mean_episode_length is None else 0.0,
+                timer.finish(),
             )
             ep_infos.clear()
 
@@ -481,6 +558,7 @@ class HIMOnPolicyRunner:
         episodes_completed: int,
         partial_mean_reward: float,
         partial_mean_episode_length: float,
+        profile_times: dict[str, float] | None = None,
     ):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time += collection_time + learn_time
@@ -489,8 +567,8 @@ class HIMOnPolicyRunner:
         mean_reward = statistics.mean(rewbuffer) if rewbuffer else None
         mean_episode_length = statistics.mean(lenbuffer) if lenbuffer else None
         mean_noise_std = self.alg.actor_critic.std.mean().item()
-        self.episode_metric_history.extend(info.copy() for info in ep_infos)
-        episode_metrics = self._aggregate_episode_infos(list(self.episode_metric_history))
+        self._push_episode_metric_batch(self._episode_metric_batch(ep_infos))
+        episode_metrics = self._episode_metric_averages()
         if mean_reward is not None:
             self.latest_mean_reward = mean_reward
         if mean_episode_length is not None:
@@ -508,7 +586,6 @@ class HIMOnPolicyRunner:
             else:
                 display_episode_length = partial_mean_episode_length
         display_episode_metrics = episode_metrics if episode_metrics else list(self.latest_episode_metrics.items())
-        running_metrics = self._collect_running_episode_metrics(partial_mean_reward, partial_mean_episode_length)
 
         if self.writer is not None:
             self.writer.add_scalar("Loss/value_function", mean_value_loss, iteration)
@@ -529,10 +606,10 @@ class HIMOnPolicyRunner:
             self.writer.add_scalar("Train/mean_reward", display_reward, iteration)
             self.writer.add_scalar("Train/mean_episode_length", display_episode_length, iteration)
             self.writer.add_scalar("Train/episodes_completed", episodes_completed, iteration)
-            self.writer.add_scalar("Train/episode_metric_batches", len(self.episode_metric_history), iteration)
+            self.writer.add_scalar("Train/episode_metric_batches", len(self.episode_metric_window), iteration)
+            for name, value in (profile_times or {}).items():
+                self.writer.add_scalar(f"Perf/{name}_time", value, iteration)
             for key, value in display_episode_metrics:
-                self.writer.add_scalar(key, value, iteration)
-            for key, value in running_metrics.items():
                 self.writer.add_scalar(key, value, iteration)
 
         width = 80
@@ -552,12 +629,12 @@ class HIMOnPolicyRunner:
             f"{'Mean reward:':>{pad}} {display_reward:.2f}\n"
             f"{'Mean episode length:':>{pad}} {display_episode_length:.2f}\n"
             f"{'Episodes completed this iteration:':>{pad}} {episodes_completed}\n"
-            f"{'Episode metric history batches:':>{pad}} {len(self.episode_metric_history)}\n"
+            f"{'Episode metric history batches:':>{pad}} {len(self.episode_metric_window)}\n"
         )
         for key, value in display_episode_metrics:
             log_string += f"{key:>{pad}}: {value:.4f}\n"
-        for key, value in running_metrics.items():
-            log_string += f"{key:>{pad}}: {value:.4f}\n"
+        for name, value in (profile_times or {}).items():
+            log_string += f"{('Profile ' + name + ' time:'):>{pad}} {value * 1e3:.3f}ms\n"
         log_string += (
             f"{'-' * width}\n"
             f"{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"
@@ -567,48 +644,26 @@ class HIMOnPolicyRunner:
         )
         print(log_string, flush=True)
 
-    def _collect_running_episode_metrics(self, running_reward: float, running_length: float) -> dict[str, float]:
-        """Snapshot metrics for in-progress episodes once per rollout iteration."""
-        env = getattr(self.env, "unwrapped", self.env)
-        metrics = {
-            "Running/episode_reward": running_reward,
-            "Running/episode_length": running_length,
-        }
-
-        reward_sums = getattr(getattr(env, "reward_manager", None), "_episode_sums", {})
-        for term_name, values in reward_sums.items():
-            metrics[f"Running/Episode_Reward/{term_name}"] = self._mean_metric_value(values)
-
-        command_manager = getattr(env, "command_manager", None)
-        if command_manager is not None:
-            command_term = command_manager.get_term("base_velocity")
-            for name, values in command_term.metrics.items():
-                metrics[f"Running/Metrics/base_velocity/{name}"] = self._mean_metric_value(values)
-
-        terrain = getattr(getattr(env, "scene", None), "terrain", None)
-        terrain_levels = getattr(terrain, "terrain_levels", None)
-        if terrain_levels is not None:
-            metrics["Running/Curriculum/terrain_levels"] = self._mean_metric_value(terrain_levels)
-        return metrics
-
-    @staticmethod
-    def _mean_metric_value(value) -> float:
-        if isinstance(value, torch.Tensor):
-            return float(value.detach().float().mean().item())
-        return float(value)
-
     @staticmethod
     def _append_episode_log(ep_infos: list[dict], infos: dict):
         ep_info = HIMOnPolicyRunner._extract_log_dict(infos)
         if isinstance(ep_info, dict) and ep_info:
-            ep_infos.append(ep_info.copy())
+            # Snapshot on the producer device. Moving each reset's individual
+            # scalar to CPU would synchronize CUDA repeatedly inside rollout.
+            ep_infos.append({
+                key: value.detach().to(dtype=torch.float32).clone()
+                if isinstance(value, torch.Tensor) else value
+                for key, value in ep_info.items()
+            })
 
     @staticmethod
     def _extract_log_dict(infos: dict | None) -> dict | None:
         if not isinstance(infos, dict):
             return None
         ep_info = infos.get("log")
-        return ep_info if isinstance(ep_info, dict) else None
+        if not isinstance(ep_info, dict):
+            return None
+        return {key: value for key, value in ep_info.items() if key.startswith(("Episode", "Metrics/"))}
 
     def _update_episode_metric_cache(self, ep_info: dict | None):
         if not ep_info:
@@ -619,51 +674,88 @@ class HIMOnPolicyRunner:
     def _aggregate_episode_infos(
         self, ep_infos: list[dict[str, torch.Tensor | float | int]]
     ) -> list[tuple[str, float]]:
-        if not ep_infos:
-            return []
-        metrics: list[tuple[str, float]] = []
-        ordered_keys = self._ordered_metric_keys(ep_infos)
-        for key in ordered_keys:
-            values = []
-            for ep_info in ep_infos:
-                if key not in ep_info:
-                    continue
-                value = ep_info[key]
-                if not isinstance(value, torch.Tensor):
-                    value = torch.tensor([value], device=self.device, dtype=torch.float32)
-                else:
-                    value = value.to(self.device, dtype=torch.float32)
-                if value.ndim == 0:
-                    value = value.unsqueeze(0)
-                values.append(value.flatten())
-            if values:
-                metrics.append((key, torch.cat(values).mean().item()))
-        return metrics
+        batch = self._episode_metric_batch(ep_infos)
+        return self._order_metric_items(
+            [(key, total / count) for key, (total, count) in batch.items() if count]
+        )
 
     @staticmethod
-    def _ordered_metric_keys(ep_infos: list[dict[str, torch.Tensor | float | int]]) -> list[str]:
-        priority_keys = [
+    def _episode_metric_batch(
+        ep_infos: list[dict[str, torch.Tensor | float | int]]
+    ) -> dict[str, tuple[float, int]]:
+        """Per-key (sum, count) of episode metrics, read back with one transfer."""
+        if not ep_infos:
+            return {}
+        grouped: dict[str, list] = {}
+        for ep_info in ep_infos:
+            for key, value in ep_info.items():
+                grouped.setdefault(key, []).append(value)
+
+        pieces: list[torch.Tensor] = []
+        spans: dict[str, tuple[int, int]] = {}
+        cursor = 0
+        device = next(
+            (value.device for values in grouped.values() for value in values
+             if isinstance(value, torch.Tensor) and value.is_cuda),
+            torch.device("cpu"),
+        )
+        for key, values in grouped.items():
+            flat = []
+            for value in values:
+                if isinstance(value, torch.Tensor):
+                    value = value.detach()
+                    if value.dtype != torch.float32:
+                        value = value.to(torch.float32)
+                    flat.append(value.reshape(-1).to(device))
+                else:
+                    flat.append(torch.tensor([float(value)], dtype=torch.float32, device=device))
+            merged = torch.cat(flat) if len(flat) > 1 else flat[0]
+            pieces.append(merged)
+            spans[key] = (cursor, cursor + merged.numel())
+            cursor += merged.numel()
+        combined = (torch.cat(pieces) if len(pieces) > 1 else pieces[0]).cpu()
+        return {
+            key: (float(combined[start:stop].sum()), stop - start)
+            for key, (start, stop) in spans.items()
+        }
+
+    def _push_episode_metric_batch(self, batch: dict[str, tuple[float, int]]):
+        """Slide the metric window forward while keeping running per-key totals."""
+        if not batch:
+            return
+        window = self.episode_metric_window
+        if len(window) == window.maxlen:
+            for key, (total, count) in window[0].items():
+                running = self._episode_metric_totals.get(key)
+                if running is None:
+                    continue
+                running[0] -= total
+                running[1] -= count
+                if running[1] <= 0:
+                    self._episode_metric_totals.pop(key, None)
+        window.append(batch)
+        for key, (total, count) in batch.items():
+            running = self._episode_metric_totals.setdefault(key, [0.0, 0])
+            running[0] += total
+            running[1] += count
+
+    def _episode_metric_averages(self) -> list[tuple[str, float]]:
+        return self._order_metric_items(
+            [(key, total / count) for key, (total, count) in self._episode_metric_totals.items() if count]
+        )
+
+    @staticmethod
+    def _order_metric_items(items: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        priority_keys = (
             "Metrics/base_velocity/error_vel_x",
             "Metrics/base_velocity/error_vel_y",
             "Metrics/base_velocity/error_vel_z",
             "Metrics/base_velocity/error_vel_dir",
             "Metrics/base_velocity/error_vel_xy",
             "Metrics/base_velocity/error_vel_yaw",
-        ]
-        keys = []
-        seen = set()
-        for key in priority_keys:
-            for ep_info in ep_infos:
-                if key in ep_info and key not in seen:
-                    keys.append(key)
-                    seen.add(key)
-                    break
-        for ep_info in ep_infos:
-            for key in ep_info:
-                if key not in seen:
-                    keys.append(key)
-                    seen.add(key)
-        return keys
+        )
+        priority = {key: index for index, key in enumerate(priority_keys)}
+        return sorted(items, key=lambda item: priority.get(item[0], len(priority)))
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -672,3 +764,57 @@ class HIMOnPolicyRunner:
         minutes = (total_seconds % 3600) // 60
         secs = total_seconds % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class _SectionTimer:
+    """Split collection time per rollout section with CUDA events.
+
+    Disabled unless ``ROBOT_LAB_PROFILE=1``; the rollout then reports how much of
+    each iteration the policy, the environment step and post-processing take.
+    """
+
+    SECTIONS = ("act", "env", "post")
+
+    def __init__(self, device):
+        self.enabled = (
+            bool(os.environ.get("ROBOT_LAB_PROFILE"))
+            and str(device).startswith("cuda")
+            and torch.cuda.is_available()
+        )
+        self._pairs: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            name: [] for name in self.SECTIONS
+        }
+        self._cursor: dict[str, int] = {name: 0 for name in self.SECTIONS}
+
+    def reset(self):
+        if not self.enabled:
+            return
+        self._cursor = {name: 0 for name in self.SECTIONS}
+
+    def start(self, name: str):
+        if not self.enabled:
+            return
+        index = self._cursor[name]
+        pairs = self._pairs[name]
+        if index == len(pairs):
+            pairs.append((torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)))
+        pairs[index][0].record()
+
+    def stop(self, name: str):
+        if not self.enabled:
+            return
+        pairs = self._pairs[name]
+        pairs[self._cursor[name]][1].record()
+        self._cursor[name] += 1
+
+    def finish(self) -> dict[str, float] | None:
+        if not self.enabled:
+            return None
+        torch.cuda.synchronize()
+        totals = {}
+        for name in self.SECTIONS:
+            total_ms = 0.0
+            for start, stop in self._pairs[name][: self._cursor[name]]:
+                total_ms += start.elapsed_time(stop)
+            totals[name] = total_ms * 1e-3
+        return totals

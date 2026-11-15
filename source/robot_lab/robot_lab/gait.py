@@ -88,7 +88,7 @@ class TrotClock:
         advance = torch.where(self.stopping, torch.minimum(advance, until_landing), advance)
         self.phase[:] = torch.remainder(self.phase + advance * self.active, 1.0)
         landed = self.stopping & (advance >= until_landing - 1.0e-6)
-        self.stopping[landed] = False
+        self.stopping.logical_and_(~landed)
 
     def observation(self):
         angle = 2.0 * math.pi * self.phase
@@ -141,8 +141,13 @@ def standing_motion_error(joint_velocity, action_delta, active):
 
 
 def swing_clearance_error(clearance, progress, swing_weight, valid, active, height: float, std: float,
-                          deficit_only: bool = False):
-    target = height * torch.sin(math.pi * progress).square()
+                          deficit_only: bool = False, profile: str = "sin_squared"):
+    lift = torch.sin(math.pi * progress)
+    if profile == "sin_squared":
+        lift = lift.square()
+    elif profile != "sin":
+        raise ValueError(f"Unknown swing profile: {profile}")
+    target = height * lift
     delta = clearance - target
     if deficit_only:
         delta = delta.clamp(max=0.0)
@@ -155,6 +160,15 @@ def swing_clearance_error(clearance, progress, swing_weight, valid, active, heig
 def stair_traversal_success(progress, height_change, eligible, failed, distance: float, min_height: float):
     """Evaluate completed stair episodes, excluding falls and non-stair commands."""
     return eligible & ~failed & (progress >= distance) & (height_change >= min_height)
+
+
+def stair_edge_error(heights, contact, active, tolerance: float):
+    """Footprint height spread penalizes loaded edges; missed rays are ignored."""
+    valid = torch.isfinite(heights).all(dim=-1)
+    heights = torch.where(torch.isfinite(heights), heights, 0.0)
+    spread = heights.amax(dim=-1) - heights.amin(dim=-1)
+    edge = ((spread - tolerance) / tolerance).clamp(0.0, 1.0)
+    return (edge * contact * valid).mean(dim=-1) * active
 
 
 def foot_geometry(body_pos, body_quat, offsets, radius: float, half_width: float):

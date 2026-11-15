@@ -17,6 +17,24 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def terrain_levels_stairs(env: ManagerBasedRLEnv, env_ids: Sequence[int]) -> torch.Tensor:
+    """Change stair rows only after measured traversal succeeds."""
+    terrain = env.scene.terrain
+    command_term = env.command_manager.get_term("base_velocity")
+    progress = command_term.metrics["stair_progress"][env_ids]
+    height_change = command_term.metrics["stair_height_change"][env_ids]
+    command = env.command_manager.get_command("base_velocity")[env_ids, :2]
+    eligible = command_term._had_translation[env_ids] & command_term._start_valid[env_ids]
+    success = eligible & (progress >= command_term.cfg.success_distance) & (
+        height_change >= command_term.cfg.min_height_change
+    )
+    move_up = success
+    required = torch.linalg.vector_norm(command, dim=1) * env.max_episode_length_s * 0.5
+    move_down = eligible & ~success & (progress < 0.6)
+    terrain.update_env_origins(env_ids, move_up, move_down)
+    return terrain.terrain_levels.float().mean()
+
+
 def command_levels_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

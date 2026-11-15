@@ -17,7 +17,7 @@ from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from isaaclab.utils.warp import raycast_mesh
 
-from robot_lab.gait import contact_violation, foot_geometry, standing_motion_error, swing_clearance_error
+from robot_lab.gait import contact_violation, foot_geometry, stair_edge_error, standing_motion_error, swing_clearance_error
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -545,12 +545,26 @@ class SwingClearancePenalty(ManagerTermBase):
         self.offsets = torch.tensor(cfg.params["foot_offsets"], device=env.device)
         if self.offsets.shape != (4, 3) or len(self.body_ids) != 4:
             raise ValueError("Swing clearance requires four ordered foot bodies and four xyz offsets.")
+        self._terrain_cache_key = (
+            cfg.params["asset_cfg"].name, tuple(self.body_ids),
+            tuple(tuple(offset) for offset in cfg.params["foot_offsets"]),
+            tuple(self.scanner.cfg.mesh_prim_paths),
+            cfg.params["foot_radius"], cfg.params["foot_half_width"],
+        )
+        self._sample_offsets = self.offsets.new_tensor(
+            ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (0, 0))
+        )
+
+    def reset(self, env_ids=None):
+        # A reset can change poses without advancing common_step_counter.
+        self._env._gait_terrain_cache = None
 
     def __call__(
         self, env, asset_cfg, terrain_sensor_cfg, command_name, foot_offsets,
         foot_radius: float, foot_half_width: float, height: float, std: float,
         terrain_sample_radius: float = 0.0, lookahead_distance: float = 0.0,
         deficit_only: bool = False,
+        profile: str = "sin_squared",
     ):
         clock = env.command_manager.get_term(command_name).gait_clock
         _, swing, progress = clock.foot_targets()
@@ -562,32 +576,38 @@ class SwingClearancePenalty(ManagerTermBase):
         # Accessing data ensures the lazy ray caster has initialized its mesh.
         _ = self.scanner.data
         mesh = RayCaster.meshes[self.scanner.cfg.mesh_prim_paths[0]]
-        command = env.command_manager.get_command(command_name)[:, :2]
-        yaw = data.heading_w
-        direction = torch.stack((
-            yaw.cos() * command[:, 0] - yaw.sin() * command[:, 1],
-            yaw.sin() * command[:, 0] + yaw.cos() * command[:, 1],
-        ), dim=-1)
-        direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
         # Probe the sole footprint and the next edge in the commanded direction.
         # At swing boundaries lookahead fades out, allowing normal touchdown.
-        offsets = center.new_tensor(((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)))
-        offsets *= terrain_sample_radius
-        starts = center.unsqueeze(-2).expand(-1, -1, 6, -1).clone()
-        starts[..., :2] += offsets
-        starts[:, :, -1, :2] += (
-            direction[:, None, :] * lookahead_distance * torch.sin(torch.pi * progress).unsqueeze(-1)
-        )
+        sample_count = 6 if terrain_sample_radius > 0 or lookahead_distance > 0 else 1
+        starts = center.unsqueeze(-2).expand(-1, -1, sample_count, -1).clone()
+        starts[..., :2] += self._sample_offsets[:sample_count] * terrain_sample_radius
+        if lookahead_distance > 0:
+            command = env.command_manager.get_command(command_name)[:, :2]
+            yaw = data.heading_w
+            cosine, sine = yaw.cos(), yaw.sin()
+            direction = torch.stack((
+                cosine * command[:, 0] - sine * command[:, 1],
+                sine * command[:, 0] + cosine * command[:, 1],
+            ), dim=-1)
+            direction /= direction.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            starts[:, :, -1, :2] += (
+                direction[:, None, :] * lookahead_distance * torch.sin(torch.pi * progress).unsqueeze(-1)
+            )
         starts[..., 2] += 0.5
         directions = torch.zeros_like(starts)
         directions[..., 2] = -1.0
         hits, _, normals, _ = raycast_mesh(starts, directions, mesh=mesh, max_dist=2.0, return_normal=True)
+        if sample_count >= 5:
+            env._gait_terrain_cache = (
+                env.common_step_counter, self._terrain_cache_key,
+                terrain_sample_radius, hits[..., :5, 2],
+            )
         valid_samples = torch.isfinite(hits).all(dim=-1) & torch.isfinite(normals).all(dim=-1)
         valid_samples &= normals[..., 2].abs() >= 0.5
         valid = valid_samples.all(dim=-1)
         ground = torch.where(valid_samples, hits[..., 2], 0.0).max(dim=-1).values
         clearance = center[..., 2] - extent - ground
-        return swing_clearance_error(clearance, progress, swing, valid, clock.active, height, std, deficit_only)
+        return swing_clearance_error(clearance, progress, swing, valid, clock.active, height, std, deficit_only, profile)
 
 
 class StairLandingPenalty(SwingClearancePenalty):
@@ -597,29 +617,33 @@ class StairLandingPenalty(SwingClearancePenalty):
         super().__init__(cfg, env)
         self.sensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
         self.contact_ids = cfg.params["sensor_cfg"].body_ids
+        self._landing_offsets = torch.cat((
+            self._sample_offsets[:5], self.offsets.new_zeros((5, 1)),
+        ), dim=-1) * cfg.params["foot_radius"]
 
     def __call__(self, env, asset_cfg, terrain_sensor_cfg, command_name, foot_offsets,
                  sensor_cfg, foot_radius: float, foot_half_width: float, edge_tolerance: float):
-        data = self.asset.data
-        center, _ = foot_geometry(
-            data.body_link_pos_w[:, self.body_ids], data.body_link_quat_w[:, self.body_ids],
-            self.offsets, foot_radius, foot_half_width,
-        )
-        offsets = center.new_tensor(((0, 0, 0), (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0)))
-        starts = center.unsqueeze(-2) + offsets * foot_radius
-        starts[..., 2] += 0.5
-        directions = torch.zeros_like(starts)
-        directions[..., 2] = -1.0
-        _ = self.scanner.data
-        mesh = RayCaster.meshes[self.scanner.cfg.mesh_prim_paths[0]]
-        hits, _, _, _ = raycast_mesh(starts, directions, mesh=mesh, max_dist=2.0)
-        valid = torch.isfinite(hits).all(dim=-1).all(dim=-1)
-        heights = torch.where(torch.isfinite(hits[..., 2]), hits[..., 2], 0.0)
-        spread = heights.max(dim=-1).values - heights.min(dim=-1).values
-        edge = ((spread - edge_tolerance) / edge_tolerance).clamp(0.0, 1.0)
+        cached = getattr(env, "_gait_terrain_cache", None)
+        if (cached is not None and cached[0] == env.common_step_counter
+                and cached[1] == self._terrain_cache_key and cached[2] == foot_radius):
+            heights = cached[3]
+        else:
+            data = self.asset.data
+            center, _ = foot_geometry(
+                data.body_link_pos_w[:, self.body_ids], data.body_link_quat_w[:, self.body_ids],
+                self.offsets, foot_radius, foot_half_width,
+            )
+            starts = center.unsqueeze(-2) + self._landing_offsets
+            starts[..., 2] += 0.5
+            directions = torch.zeros_like(starts)
+            directions[..., 2] = -1.0
+            _ = self.scanner.data
+            mesh = RayCaster.meshes[self.scanner.cfg.mesh_prim_paths[0]]
+            hits, _, _, _ = raycast_mesh(starts, directions, mesh=mesh, max_dist=2.0)
+            heights = hits[..., 2]
         contact = self.sensor.data.current_contact_time[:, self.contact_ids] > 0.0
         active = env.command_manager.get_term(command_name).gait_clock.active
-        return (edge * contact * valid).mean(dim=-1) * active
+        return stair_edge_error(heights, contact, active, edge_tolerance)
 
 
 def standing_support(

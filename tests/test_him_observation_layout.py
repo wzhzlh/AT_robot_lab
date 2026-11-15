@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import sys
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -152,6 +153,31 @@ class HimLayoutTests(unittest.TestCase):
         runner.env.default_estimator_vel_slice = (0, 4)
         with self.assertRaisesRegex(ValueError, "exactly 3-D"):
             runner._resolve_estimator_slices(48)
+
+    def test_episode_log_snapshot_and_mixed_metric_aggregation(self):
+        runner = HIMOnPolicyRunner.__new__(HIMOnPolicyRunner)
+        original = torch.tensor([1.0, 3.0])
+        history = []
+        runner._append_episode_log(history, {"log": {
+            "Episode_Reward/test": original, "Metrics/test": 2.0,
+            "Running/episode_reward": 100.0, "Curriculum/terrain_levels": 2.0,
+        }})
+        original.fill_(100.0)
+        history.append({"Episode_Reward/test": 5.0, "Episode_Termination/test": 1})
+        self.assertEqual(dict(runner._aggregate_episode_infos(history)), {
+            "Episode_Reward/test": 3.0, "Metrics/test": 2.0, "Episode_Termination/test": 1.0,
+        })
+
+    def test_episode_metric_window_evicts_old_batches(self):
+        runner = HIMOnPolicyRunner.__new__(HIMOnPolicyRunner)
+        runner.episode_metric_window = deque(maxlen=2)
+        runner._episode_metric_totals = {}
+        runner._push_episode_metric_batch({"Episode_Reward/test": (3.0, 1)})
+        runner._push_episode_metric_batch({"Episode_Reward/test": (6.0, 2)})
+        self.assertEqual(dict(runner._episode_metric_averages()), {"Episode_Reward/test": 3.0})
+        runner._push_episode_metric_batch({"Episode_Reward/test": (9.0, 3)})
+        self.assertAlmostEqual(dict(runner._episode_metric_averages())["Episode_Reward/test"], 3.0)
+        self.assertEqual(len(runner.episode_metric_window), 2)
 
     def test_estimator_supervision_uses_velocity_not_actions(self):
         from robot_lab.him.him_estimator import HIMEstimator

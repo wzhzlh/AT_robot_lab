@@ -67,7 +67,7 @@ class ATDogDog2FlatEnvCfg(ATDogDog2RoughEnvCfg):
         # change terrain to flat
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        # Keep the ray caster for privileged critic terrain observations.
+        # Keep the ray caster for terrain-aware rewards; critic height_scan is disabled.
         self.observations.policy.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None

@@ -1,16 +1,20 @@
 # Copyright (c) 2024-2025 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
+from copy import deepcopy
+
+from robot_lab.actuators import StreamDelayedPDActuator
 import robot_lab.tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.envs import mdp as isaaclab_mdp
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
 from .periodic_gait import configure_gait_rewards, configure_periodic_gait
 from .stairs_terrain import ATDog2StairsTerrainGeneratorCfg
+from .stairs_rewards import configure_stair_rewards
+from robot_lab.terrain_sensor import StreamRayCaster
 
 ##
 # Pre-defined configs
@@ -35,14 +39,14 @@ DOG2_STAIRS_TERRAIN_CFG = ATDog2StairsTerrainGeneratorCfg(
     vertical_scale=0.005,
     slope_threshold=0.75,
     use_cache=False,
-    curriculum=False,
+    curriculum=True,
     flat_ratio=0.30,
     up_ratio=0.65,
     sub_terrains={
         "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0),
         "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=1.0,
-            step_height_range=(0.04, 0.06),#(最初0.07-0.13)
+            step_height_range=(0.04, 0.06),# curriculum rows: 4-12 cm
             step_width=0.30,
             platform_width=3.0,
             border_width=1.0,
@@ -91,11 +95,17 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 覆写默认 rough terrain：仅使用固定参数台阶地形
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = DOG2_STAIRS_TERRAIN_CFG
+        self.scene.terrain.max_init_terrain_level = 1
         # 指定机器人资产，并放置到每个并行环境的 Robot prim 下
         self.scene.robot = AT_DOG2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Keep independent joint delays and upstream PD; avoid buffer scalar CUDA syncs.
+        self.scene.robot.actuators = deepcopy(self.scene.robot.actuators)
+        for actuator in self.scene.robot.actuators.values():
+            actuator.class_type = StreamDelayedPDActuator
         # 将高度扫描器挂到机身 base 上，保证地形感知参考系一致
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
         self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
+        self.scene.height_scanner_base.class_type = StreamRayCaster
 
         # ------------------------------Observations 观测------------------------------
         # 各观测分量缩放系数:
@@ -109,12 +119,7 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # 说明: 这里常用于做“部分可观测”训练，迫使策略更依赖本体状态
         self.observations.policy.base_lin_vel = None
         self.observations.policy.height_scan = None
-        self.observations.critic.height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            clip=(-1.0, 1.0),
-            scale=1.0,
-        )
+        self.observations.critic.height_scan = None
         self.observations.policy.velocity_commands.scale = (1.0, 1.0, 0.25)
         self.observations.critic.velocity_commands.scale = (1.0, 1.0, 0.25)
         # 明确 joint_pos/joint_vel 仅采集 joint_names 中定义的关节
@@ -206,19 +211,13 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Root penalties
         # 惩罚机身 z 方向线速度，抑制“跳跃/颠簸”。
         # 绝对值增大 -> 更追求贴地平稳；过大可能抑制跨越障碍能力。
-        self.rewards.lin_vel_z_l2.weight = -10.0
+        self.rewards.lin_vel_z_l2.weight = -5.0
         # 惩罚机身 x/y 角速度（roll/pitch 旋转速度），降低侧翻和点头抖动。
         self.rewards.ang_vel_xy_l2.weight = -6.0
         # 惩罚机身姿态偏离水平（roll/pitch 倾斜角误差）。
         # 当前关闭，更多依赖速度追踪与接触项“间接”学稳定姿态。
         self.rewards.flat_orientation_l2.weight = -2.0
-        # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
-        # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -10.0
-        # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.33
-        # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
-        self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
+        # 台阶机身高度由 configure_stair_rewards 的实际接触支撑高度计算。
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
         # 该项常用于减小真实机器冲击与传感器饱和风险。
         self.rewards.body_lin_acc_l2.weight = -2.0e-4
@@ -227,23 +226,25 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Joint penalties
         # 力矩 L2 惩罚，控制能耗并抑制“暴力驱动”。
         # 通常与 joint_power 配合，一个约束幅值，一个约束功率。
-        self.rewards.joint_torques_l2.weight = -2.5e-5
+        self.rewards.joint_torques_l2.weight = -2.5e-6
         # 关节速度 L2 惩罚，抑制关节甩动，当前关闭。
         self.rewards.joint_vel_l2.weight = 0
         # 关节加速度 L2 惩罚，鼓励动作更平滑、降低冲击。
-        self.rewards.joint_acc_l2.weight = -1.0e-5
+        # Recent stair rollouts: this cost (~39) dwarfs stair penalties (~1.5).
+        # Ease it by 25%; keep action-rate/smoothness and contact protection.
+        self.rewards.joint_acc_l2.weight = -7.5e-6
         # self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.2, [".*_hip_joint"])
         # 关节限位惩罚: 接近/触发关节上下限时强惩罚，防止打限位。
         self.rewards.joint_pos_limits.weight = -2.0
         # 关节速度上限惩罚，当前关闭（可在硬件部署前再打开做保守化）。
         self.rewards.joint_vel_limits.weight = 0
         # 关节功率惩罚（约束机械功输出），降低发热与电池消耗。
-        self.rewards.joint_power.weight = -4.0e-5
+        self.rewards.joint_power.weight = -4.0e-6
         # 静止命令下站立惩罚项（鼓励“该停就停”）。
         # 权重绝对值越大，零速命令时越倾向快速收敛到稳态。
         self.rewards.stand_still.weight = -10.0
         # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型。
-        self.rewards.joint_pos_penalty.weight = -2.0
+        self.rewards.joint_pos_penalty.weight = -1.0
         self.rewards.joint_pos_penalty.params["stand_still_scale"] =4.0
         # 镜像对称惩罚: 约束对角腿运动统计相近，减少“偏腿”步态。
         self.rewards.joint_mirror.weight = -0.2
@@ -258,9 +259,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -1.5
+        self.rewards.action_rate_l2.weight = -1.0
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
-        self.rewards.action_smoothness_2_l2.weight = -0.6
+        self.rewards.action_smoothness_2_l2.weight = -0.3
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
@@ -270,22 +271,23 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         ]
         # 足端接触力惩罚，避免落脚冲击过大。
         # 过大可能导致“轻触地”倾向，影响抓地与推进效率。
-        self.rewards.contact_forces.weight = -1.5e-4
+        self.rewards.contact_forces.weight = -1.5e-5
         self.rewards.contact_forces.params["sensor_cfg"].body_names = [self.foot_link_name]
 
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 60.0
+        self.rewards.track_lin_vel_xy_exp.weight = 30.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 40.0
+        # Stair commands request zero yaw: avoid over-rewarding no-turn stalling.
+        self.rewards.track_ang_vel_z_exp.weight = 15.0
 
         # Others
         # 足接触奖励（可用于鼓励稳定支撑），当前关闭。
         self.rewards.feet_contact.weight = 0
         self.rewards.feet_contact.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 绊脚/碰撞惩罚，当前关闭（可按地形难度逐步启用）。
-        self.rewards.feet_stumble.weight = -1.0
+        self.rewards.feet_stumble.weight = -5.0
         self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 机身“向上”姿态奖励（保持重力反方向对齐），提升整体直立稳定性。
         self.rewards.upward.weight = 0.0
@@ -295,31 +297,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.feet_distance_y_exp.params["std"] = 0.15
         self.rewards.feet_distance_y_exp.params["asset_cfg"].body_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
 
-        configure_gait_rewards(self, swing_height=0.12)
-        # 台阶接触允许更宽的触地过渡；加强摆腿，而非硬性提高接触惩罚。
-        self.rewards.gait_contact.weight = -7.5
-        self.rewards.swing_clearance.weight = -15.0
-        self.rewards.swing_clearance.params.update(
-            std=0.06, terrain_sample_radius=0.0384,
-            lookahead_distance=0.08, deficit_only=True,
-        )
-        self.rewards.stair_landing = RewTerm(
-            func=mdp.StairLandingPenalty,
-            weight=-3.0,
-            params={
-                "asset_cfg": self.rewards.swing_clearance.params["asset_cfg"],
-                "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
-                "sensor_cfg": SceneEntityCfg(
-                    "contact_forces", body_names=["FL_calf", "FR_calf", "RL_calf", "RR_calf"],
-                    preserve_order=True,
-                ),
-                "command_name": "base_velocity",
-                "foot_offsets": self.rewards.swing_clearance.params["foot_offsets"],
-                "foot_radius": 0.0384,
-                "foot_half_width": 0.014,
-                "edge_tolerance": 0.015,
-            },
-        )
+        # Keep quiet-standing terms; stair-specific terms replace generic gait penalties below.
+        configure_gait_rewards(self, swing_height=0.15)
+        configure_stair_rewards(self)
 
         # 将权重为0的奖励项禁用，减少无效计算与配置噪声
         if self.__class__.__name__ == "ATDogDog2StairsEnvCfg":
@@ -333,8 +313,9 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
         # self.curriculum.command_levels.params["range_multiplier"] = (0.2, 1.0)
         # 关闭命令课程，直接使用固定命令范围
         self.curriculum.command_levels = None
-        # CSDog stairs 在训练期间固定地形分布，用命令方向进度衡量成功。
-        self.curriculum.terrain_levels = None
+        # Terrain rows are generated from 4 cm to 12 cm. Promote only after
+        # measured stair traversal, rather than displacement alone.
+        self.curriculum.terrain_levels.func = mdp.terrain_levels_stairs
 
         # ------------------------------Commands 命令范围------------------------------
         self.commands.base_velocity = mdp.StairsVelocityCommandCfg(
@@ -350,7 +331,13 @@ class ATDogDog2StairsEnvCfg(LocomotionVelocityRoughEnvCfg):
             stair_speed_range=(0.25, 0.8),
             lateral_ratio=0.35,
             min_command_speed=0.2,
-            success_distance=2.1,
-            min_height_change=0.06,
+            success_distance=0.85,
+            min_height_change=0.05,
         )
-        self.commands.base_velocity.gait.transition_width = 0.08
+        self.commands.base_velocity.gait.cycle_time = 0.5
+        self.commands.base_velocity.gait.duty_factor = 0.55
+        self.commands.base_velocity.gait.transition_width = 0.07
+        self.commands.base_velocity.gait.linear_enter = 0.05
+        self.commands.base_velocity.gait.linear_exit = 0.025
+        self.commands.base_velocity.gait.angular_enter = 0.05
+        self.commands.base_velocity.gait.angular_exit = 0.025

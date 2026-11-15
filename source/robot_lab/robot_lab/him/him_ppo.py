@@ -88,7 +88,8 @@ class HIMPPO:
         next_critic_obs: torch.Tensor,
         estimator_valid: torch.Tensor,
     ):
-        self.transition.next_critic_observations = next_critic_obs.clone()
+        # The wrapper owns this buffer and the rollout storage copies it immediately.
+        self.transition.next_critic_observations = next_critic_obs
         self.transition.estimator_valid = estimator_valid
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
@@ -104,11 +105,7 @@ class HIMPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self) -> tuple[float, float, float, float, float]:
-        mean_value_loss = 0.0
-        mean_surrogate_loss = 0.0
-        mean_estimation_loss = 0.0
-        mean_swap_loss = 0.0
-        mean_entropy_loss = 0.0
+        loss_totals = torch.zeros(5, device=self.device, dtype=torch.float64)
 
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
@@ -155,6 +152,7 @@ class HIMPPO:
                 lr=self.estimator_learning_rate,
                 velocity_loss_coef=self.estimator_velocity_loss_coef,
                 swap_loss_coef=self.estimator_swap_loss_coef,
+                return_tensors=True,
             )
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -174,24 +172,19 @@ class HIMPPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            entropy_loss = entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_loss
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.policy_parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            mean_value_loss += float(value_loss.item())
-            mean_surrogate_loss += float(surrogate_loss.item())
-            mean_estimation_loss += estimation_loss
-            mean_swap_loss += swap_loss
-            mean_entropy_loss += float(entropy_batch.mean().item())
+            loss_totals += torch.stack((
+                value_loss.detach(), surrogate_loss.detach(), estimation_loss, swap_loss, entropy_loss.detach(),
+            )).to(dtype=loss_totals.dtype)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
-        mean_value_loss /= num_updates
-        mean_surrogate_loss /= num_updates
-        mean_estimation_loss /= num_updates
-        mean_swap_loss /= num_updates
-        mean_entropy_loss /= num_updates
+        mean_losses = (loss_totals / num_updates).cpu().tolist()
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_entropy_loss
+        return tuple(mean_losses)

@@ -57,7 +57,7 @@ docker/container.sh enter
 
 更新日期：2026-11-11。本轮已实现固定频率步态状态、接触约束、摆动间隙、持续站立奖励及导出修复；暂不扩展观测。下方保留方案说明及后续观测升级方向。修改前的检查结果见 [ATDOG2 步态相位检查报告](docs/ATDOG2_GAIT_PHASE_REVIEW.md)。
 
-当前 ATDOG2 的 actor 使用相位 sin/cos、机身角速度、重力投影、速度命令、关节位置、关节速度和上次动作，单帧共 47 维；HIM 使用 6 帧历史，共 282 维，按从旧到新排列，当前帧位于最后。Actor 不输入真实机身线速度及地形扫描，critic 保留这些特权信息。默认控制频率为 50 Hz，步态周期为 0.7 s（约 1.43 Hz）。
+当前 ATDOG2 的 actor 使用相位 sin/cos、机身角速度、重力投影、速度命令、关节位置、关节速度和上次动作，单帧共 47 维；HIM 使用 6 帧历史，共 282 维，按从旧到新排列，当前帧位于最后。Actor 不输入真实机身线速度及地形扫描，critic 保留真实机身线速度，但不再输入地形扫描。默认控制频率为 50 Hz，步态周期为 0.7 s（约 1.43 Hz）。
 
 平地 `Flat` 和继承它的 `FlatDomainRand` 单回合上限设为 5 s（250 个控制步），其他地形保持原配置。单回合时长控制环境超时重置，不等同于训练日志中的 `Iteration time`；运行中的训练需要重新启动后才会加载此修改，也可在启动命令末尾使用 `env.episode_length_s=5.0` 覆盖。
 
@@ -109,19 +109,19 @@ Flat 零速偏航调整：`Flat` 和 `FlatDomainRand` 新增 `standing_yaw_drift
 
 关节与动作仍按 FR、FL、RR、RL 排列，每腿依次 hip、thigh、calf；奖励通过名称单独解析 FL、FR、RL、RR，避免与观测索引混用。
 
-时钟参考实现位于 `source/robot_lab/robot_lab/gait.py`，配置入口为 `commands.base_velocity.gait`。当前固定周期 0.7 s，支撑占空比 0.6，相位边界宽容区宽度为周期的 0.05。平移进入/退出阈值为 0.08/0.04 m/s，偏航为 0.10/0.05 rad/s。停止时推进到下一段计划双支撑并冻结，最长不超过半个周期；这是按相位结束摆动，不根据接触反馈等待实际落地。该版本没有额外停止计时器、可变频率或活动强度观测。
+时钟参考实现位于 `source/robot_lab/robot_lab/gait.py`，配置入口为 `commands.base_velocity.gait`。默认固定周期 0.7 s，支撑占空比 0.6，相位边界宽容区宽度为周期的 0.05（Stairs 的覆盖值见后文「观测契约与逐任务 policy / critic 对照」）。平移进入/退出阈值为 0.08/0.04 m/s，偏航为 0.10/0.05 rad/s。停止时推进到下一段计划双支撑并冻结，最长不超过半个周期；这是按相位结束摆动，不根据接触反馈等待实际落地。该版本没有额外停止计时器、可变频率或活动强度观测。
 
 各 dog2 环境统一通过 `dog2/periodic_gait.py:configure_gait_rewards()` 配置：
 
 | 奖励项 | 权重 | 定义 |
 |---|---:|---|
 | `gait_contact` | -5 | 支撑未接触、摆动仍接触的相位违约 |
-| `swing_clearance` | -2 | 摆动足底相对脚下地形的归一化间隙误差 |
+| `swing_clearance` | -10（stairs 覆盖为 -15） | 摆动足底相对脚下地形的归一化间隙误差 |
 | `feet_slide` | -1 | 接触脚中心的水平滑移，包含刚体转动引起的速度 |
 | `standing_support` | +4 | 持续接触、低机身/脚速、低动作变化、直立姿态 |
 | `standing_joint_motion` | -2 | 停止过渡结束后的关节速度与动作变化惩罚 |
 
-摆动包络峰值为 flat/rough/slope/sand 0.07 m、flat_domain_rand 0.08 m、stairs/bar/tires 0.10 m，误差尺度为 0.04 m。足底位置使用 URDF 固定足关节偏移，并按足部网格外接圆柱计算随姿态变化的竖向支撑范围；它是足底几何近似，不是 calf 原点高度。训练奖励复用特权地形扫描器加载的网格，在脚中心竖直向下射线查询地面；无效射线和过陡侧面命中不计入间隙项。Actor 没有新增地形输入。
+摆动包络峰值为 flat/slope/sand 0.07 m、rough 0.05 m、flat_domain_rand 0.08 m、bar/tires 0.10 m、stairs 0.12 m；间隙误差尺度默认 0.10 m，stairs 为 0.06 m 并额外启用 `deficit_only`、`lookahead_distance=0.08`、`terrain_sample_radius=0.0384`。足底位置使用 URDF 固定足关节偏移，并按足部网格外接圆柱计算随姿态变化的竖向支撑范围；它是足底几何近似，不是 calf 原点高度。训练奖励复用特权地形扫描器加载的网格，在脚中心竖直向下射线查询地面；无效射线和过陡侧面命中不计入间隙项。Actor 没有新增地形输入。
 
 本轮停用旧周期接触奖励、旧对角同步/接触模式、全腿固定高度、腾空时间/方差及首次落地式静止奖励。原有速度跟踪和其他稳定性约束继续参与训练。权重与间隙高度是训练起点，尚未通过多种子训练评估效果。
 
@@ -138,6 +138,254 @@ Flat 零速偏航调整：`Flat` 和 `FlatDomainRand` 新增 `standing_yaw_drift
 ```
 
 已完成全部 dog2 环境配置检查、步态数值及现有回归测试；平地与台阶各 4 个环境运行 50 个控制步，检查了 47/282 维顺序、有限奖励、平移/转向/停止，以及 ONNX/JIT、元数据和部署时钟一致性。这些检查证明接线与计算路径可运行，步态质量和台阶通过率仍需训练评估。
+
+## ATDOG2 各训练任务的配置与观测
+
+更新日期：2026-11-14。本节按当前代码（`source/robot_lab/robot_lab/tasks/manager_based/locomotion/velocity/config/quadruped/atdog/dog2/`）整理各任务的注册入口、地形、指令、奖励权重、训练超参与观测契约，作为上一节步态/奖励方案的配置索引。两节数值冲突时以本节为准。本轮按 `dog2/periodic_gait.py::configure_periodic_gait()` 与各任务 `__post_init__()` 重新核对了 8 个任务的 policy / critic 观测，并补充逐任务对照表。
+
+### 1. 任务注册与入口
+
+| 任务 ID | 环境配置类（文件） | HIM runner | PPO runner |
+|---|---|---|---|
+| `RobotLab-Isaac-Velocity-Flat-ATDog-Dog2-v0` | `ATDogDog2FlatEnvCfg`（`flat_env_cfg.py`） | `ATDogDog2FlatHIMRunnerCfg` | `ATDogDog2FlatPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Flat-DomainRand-ATDog-Dog2-v0` | `ATDogDog2FlatDomainRandEnvCfg`（`flat_env_cfg.py`） | `ATDogDog2FlatDomainRandHIMRunnerCfg` | `ATDogDog2FlatPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Rough-ATDog-Dog2-v0` | `ATDogDog2RoughEnvCfg`（`rough_env_cfg.py`） | `ATDogDog2RoughHIMRunnerCfg` | `ATDogDog2RoughPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Stairs-ATDog-Dog2-v0` | `ATDogDog2StairsEnvCfg`（`stairs_env_cfg.py`） | `ATDogDog2StairsHIMRunnerCfg` | `ATDogDog2StairsPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Sand-ATDog-Dog2-v0` | `ATDogDog2SandEnvCfg`（`sand_env_cfg.py`） | `ATDogDog2SandHIMRunnerCfg` | `ATDogDog2SandPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Bar-ATDog-Dog2-v0` | `ATDogDog2BarEnvCfg`（`bar_env_cfg.py`） | `ATDogDog2BarHIMRunnerCfg` | `ATDogDog2BarPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Tires-ATDog-Dog2-v0` | `ATDogDog2TiresEnvCfg`（`tires_env_cfg.py`） | `ATDogDog2TiresHIMRunnerCfg` | `ATDogDog2TiresPPORunnerCfg` |
+| `RobotLab-Isaac-Velocity-Slope-ATDog-Dog2-v0` | `ATDogDog2SlopeEnvCfg`（`slope_env_cfg.py`） | `ATDogDog2SlopeHIMRunnerCfg` | `ATDogDog2SlopePPORunnerCfg` |
+
+每个任务同时注册了 `cusrl_cfg_entry_point`（`cusrl_ppo_cfg.py`，与 rsl_rl 并行的一套训练器）。注册表见 `dog2/__init__.py`，训练入口为 `scripts/reinforcement_learning/rsl_rl/train.py --agent=rsl_rl_him_cfg_entry_point`。
+
+### 2. 公共环境配置
+
+| 项目 | 取值 |
+|---|---|
+| 机器人资产 | `AT_DOG2_CFG`（URDF 固定足关节合并到 `.*_calf`，接触项按 calf 匹配；机身 `base`） |
+| 关节与动作顺序 | `FR, FL, RR, RL` × `hip, thigh, calf`，共 12 维，`preserve_order=True` |
+| 控制频率 | `sim.dt=0.005`，`decimation=4` → 50 Hz（控制周期 0.02 s） |
+| 单回合时长 | 20 s；`Flat` / `Flat-DomainRand` 为 5 s（250 控制步） |
+| 并行环境数 | 配置默认 4096，用 `--num_envs` 覆盖（近期 Flat 训练用 4000） |
+| 动作 | `JointPositionActionCfg(scale=0.25, use_default_offset, clip=-100~100)`；除 Flat/Flat-DomainRand 外，`hip` 缩放改为 0.125 |
+| 接触传感器 | `contact_forces`：`{ENV}/Robot/.*`，`history_length=3`，`track_air_time=True`，`update_period=0.005` |
+| 地形传感器 | `height_scanner`：机身 base，0.1 m 网格 ×1.6×1.0 m → 187 条射线，`update_period=0.02`，不再进入 critic；保留给奖励/地形几何查询使用 |
+| 测高传感器 | `height_scanner_base`：0.05 m 网格 ×0.1×0.1 m → 9 条射线，供 `base_height_l2`；`Bar` 关闭、`Flat` 未使用 |
+| 终止条件 | `time_out`、`terrain_out_of_bounds`（3 m 缓冲）；`illegal_contact`（base/hip）在 Stairs/Sand/Slope/Bar/Tires 启用，Rough/Flat/Flat-DomainRand 关闭 |
+| 地形课程 | `Rough` 保留 `terrain_levels`（初始等级 5）；`Bar`/`Flat-DomainRand` 显式置空；Stairs 按实际台阶进度与高度变化升降级；`Flat` 为 plane；`Sand`/`Slope`/`Tires` 未显式关闭，但只使用单一子地形，等级变化基本不改变几何 |
+
+### 3. 观测契约与逐任务 policy / critic 对照
+
+Policy（actor）单帧 47 维，HIM 取 6 帧历史 → 282 维（`oldest_to_latest`，当前帧在最后，导出索引 `[5,4,3,2,1,0]`）：
+
+| 切片 | 观测 | 缩放 | 噪声 |
+|---|---|---|---|
+| `[0:2]` | 步态时钟 `sin`、`cos`（`stairs_phase` 读取命令模块时钟） | 1 | 无 |
+| `[2:5]` | 机身角速度 | 0.25 | ±0.2 |
+| `[5:8]` | 重力投影 | 1 | ±0.05 |
+| `[8:11]` | vx、vy、yaw 命令 | `(1, 1, 0.25)` | 无 |
+| `[11:23]` | 相对默认关节位置 | 1 | ±0.01 |
+| `[23:35]` | 关节速度 | 0.05 | ±1.5 |
+| `[35:47]` | 上次动作 | 1 | 无 |
+
+Policy **不含**真实机身线速度与地形扫描（部分可观测）。Critic 共 50 维：与 policy 相同的 7 个项（同样定义、不带噪声），加上 3 维特权机身线速度；**顺序不同**（线速度在最前、相位在最后）。`configure_periodic_gait()` 对 8 个任务统一把 `critic.height_scan` 置 `None`、给 critic 增加 `phase` 项，Stairs 仅再次显式置空，不再重新添加扫描：
+
+| Critic 切片 | 分量 | 维度 | 说明 |
+|---|---|---:|---|
+| `[0:3]` | `base_lin_vel` | 3 | 特权量，缩放 2.0；HIM 训练时 `align_him_critic_observations` 清除全部 critic 噪声并关闭 critic 加噪（`him_clean_critic=True`） |
+| `[3:6]` / `[6:9]` / `[9:12]` | `base_ang_vel` / `projected_gravity` / `velocity_commands` | 3 / 3 / 3 | 与 policy 同名项对齐（含裁剪、缩放、参数） |
+| `[12:24]` / `[24:36]` / `[36:48]` | `joint_pos` / `joint_vel` / `actions` | 12 / 12 / 12 | 与 policy 同名项对齐 |
+| `[48:50]` | `phase` | 2 | 与 policy 同一时钟的 sin/cos |
+| — | `height_scan` | 0 | 已置 `None`，不输入 Critic |
+
+**逐任务 policy / critic 观测对照（2026-11-14 核对当前代码）**：记 `P = [phase(2), base_ang_vel(3), projected_gravity(3), velocity_commands(3), joint_pos(12), joint_vel(12), actions(12)]`（47 维），`C = [base_lin_vel(3), base_ang_vel(3), projected_gravity(3), velocity_commands(3), joint_pos(12), joint_vel(12), actions(12), phase(2)]`（50 维）。8 个任务的项集合、顺序、缩放与维度完全一致，差异只在相位时钟、命令分布和传感器挂载：
+
+| 任务 | policy 单帧 | HIM actor / 标准 PPO、cusrl actor | critic | 相位时钟与命令来源 | 该任务观测相关差异 |
+|---|---|---|---|---|---|
+| Flat | `P`（47） | `P×6=282` / 47 | `C`（50） | `PhaseVelocityCommandCfg`（继承 Rough 的 `heading_command=False`）+ 默认 `TrotClockCfg` | yaw 命令直接采样；`base_height_l2.params["sensor_cfg"]=None`；两个射线传感器仍在场景中但不进入任何观测组 |
+| Flat-DomainRand | `P`（47） | `P×6=282` / 47 | `C`（50） | 同上，命令范围改为 vx −0.8~1.2、vy ±0.6、站立比例 0.05 | 域随机化改变本体状态的数值分布，不改项定义；`base_height_l2` 重新指向 `height_scanner_base`（权重 0，被清理） |
+| Rough | `P`（47） | `P×6=282` / 47 | `C`（50） | 同上；Rough 在 `configure_periodic_gait()` 之后把 `heading_command` 关掉、`rel_heading_envs=0` | 唯一显式给 `critic.joint_pos/joint_vel.asset_cfg.joint_names` 指定 `self.joint_names` 的任务；保留 `terrain_levels` 课程（不输入观测） |
+| Stairs | `P`（47） | `P×6=282` / 47 | `C`（50） | `StairsVelocityCommandCfg`（`heading_command=False`），时钟 `cycle_time=0.5`、`duty_factor=0.55`、`transition_width=0.07`、平移/偏航门槛均 0.05/0.025 | `critic.height_scan=None` 再次显式置空；`phase` 的频率与占空比和其他任务不同，跨任务迁移时相位语义不一致；`terrain_levels_stairs` 只调地形等级，不进入观测 |
+| Sand | `P`（47） | `P×6=282` / 47 | `C`（50） | `PhaseVelocityCommandCfg` + 默认时钟；未显式关闭 `heading_command`（父类默认 `True`，由 `configure_periodic_gait()` 复制），yaw 由 heading 误差生成 | 无扫描观测；`height_scanner_base` 的 9 条射线只供 `base_height_l2` 奖励 |
+| Slope | `P`（47） | `P×6=282` / 47 | `C`（50） | 同 Sand 的默认时钟与 heading 命令语义 | 坡度变化不进入观测 |
+| Bar | `P`（47） | `P×6=282` / 47 | `C`（50） | 同 Sand 的默认时钟与 heading 命令语义 | `height_scanner_base=None`；`height_scanner` 由 `MySceneCfg()` 重新挂到 plane 上，仅用于奖励/几何查询 |
+| Tires | `P`（47） | `P×6=282` / 47 | `C`（50） | 同 Sand 的默认时钟与 heading 命令语义 | 两个射线传感器都重新挂到 `base`；均不进入观测组 |
+
+- 运行期变换：只有 HIM 入口（`rsl_rl_him_cfg_entry_point`）调用 `apply_him_observation_history()`，把 `P` 设为 `history_length=6`、`flatten_history_dim=True`，再由 `HIMVecEnvWrapper._reorder_policy_history()` 排成 282 维（`oldest_to_latest`，当前帧 `[235:282]`）；标准 PPO / cusrl 的 actor 仍是 47 维单帧，critic 都是 50 维。
+- `align_him_critic_observations()` 仅在 HIM 入口（train/play）把 critic 中与 policy 同名的 7 个项替换为 policy 项的深拷贝（含 scale、clip、noise、`asset_cfg`），随后按 `him_clean_critic=True` 清空噪声并设 `critic.enable_corruption=False`。因此 HIM 下所有任务的 `critic.joint_pos/joint_vel` 都使用 policy 的 12 关节显式顺序；标准 PPO / cusrl 不调用该函数，critic 保留父类 `joint_names=".*"`（Rough 例外）。
+- `critic.height_scan=None` 关闭的是观测项，不是射线计算：场景仍保留 `height_scanner`；`lazy_sensor_update=True` 下 `configure_gait_rewards()` 的摆腿净空奖励每步访问 `scanner.data`，187 条网格射线仍会每步计算，速度收益需要实测。
+- HIM 相关维度由 `HIMVecEnvWrapper` 在启动时校验并在日志打印 `policy_total / critic_total / policy_one_step`；导出时写入 `policy_metadata.json`（当前配置预期 282 / 50 / 47；历史有扫描 checkpoint 为 282 / 237 / 47）。
+
+### 4. 各任务地形
+
+| 任务 | 地形配置 | 难度/几何 | 课程 |
+|---|---|---|---|
+| Flat | `terrain_type="plane"`（仓库内 `default_environment.usd` 地面） | 平地；`height_scanner` 保留给奖励使用，不进入 critic | 无 |
+| Flat-DomainRand | `ATDOG2_LOW_OBSTACLE_TERRAIN_CFG`（generator，8×8 m，10×20 tile） | 85% 平地 + 15% 低矮方格（网格 0.45 m，高 0.01–0.025 m，平台 2.0 m） | 无，`max_init_terrain_level=None` |
+| Rough | `DOG2_ROUGH_TERRAIN_CFG`（generator，8×8 m，10×20 tile） | 倒金字塔 + 正金字塔台阶，阶高 0.09–0.11 m、阶宽 0.30 m、平台 3.0 m | `terrain_levels` 保留 |
+| Stairs | `ATDog2StairsTerrainGeneratorCfg`（自定义生成器） | 30% 平地 + 65% 上台阶 + 5% 下台阶，阶高按课程从 0.04 m 到 0.12 m、阶宽 0.30 m | 实际台阶跨越课程 |
+| Sand | `DOG2_OBSTACLE_TERRAIN_CFG`（generator） | 每 tile 16 条长条凸起，高 0.3 m、截面 0.03×1.6 m，`horizontal_scale=0.01`；注意这不是可变形沙地 | 未显式关闭（`object_params_start=end`，难度固定） |
+| Bar | 实际 `terrain_type="plane"` | 文件内减速带地形 `DOG2_ARM_ROUGH_TERRAIN_CFG`（3 条 0.05 m 高、0.12 m 厚）已定义但未挂载 | 无 |
+| Tires | `DOG2_TIRE_ARRAY_TERRAIN_CFG`（generator，5×5 tile，border 0） | 每 tile 2×2 轮胎阵列，外径 0.275 / 内径 0.165 / 宽 0.165 m、12 段，网格间距 1.18 m，中心留空作 reset 区 | 未显式关闭（单一子地形，等级不改变几何） |
+| Slope | `DOG2_SLOPE_TERRAIN_CFG` | `HfPyramidSlopedTerrainCfg`，坡度 0–0.3（约 0–16.7°），平台 1.0 m | 未显式关闭（单一子地形，等级不改变几何） |
+
+### 5. 各任务指令范围
+
+| 任务 | 重采样 | 站立比例 | vx (m/s) | vy (m/s) | yaw (rad/s) | 备注 |
+|---|---|---|---|---|---|---|
+| Flat | 5 s | 0.15 | ±1.0 | ±1.0 | ±1.0 | `debug_vis` 默认开启 |
+| Flat-DomainRand | 5 s | 0.05 | −0.8 ~ 1.2 | ±0.6 | ±1.0 | 推力扰动 15–20 s，±0.5 m/s |
+| Rough | 5 s | 0.15 | ±1.0 | ±1.0 | ±1.0 | `debug_vis` 默认开启 |
+| Stairs | 20 s | 0.15 | −0.8 ~ 1.2 | ±0.6 | ±1.0 | `StairsVelocityCommand`：沿台阶向外、速度 0.25–0.8 m/s、35% 侧向；成功判定 2.1 m / 抬升 0.06 m |
+| Sand | 5 s | 0.15 | ±1.0 | ±0.5 | ±1.0 | |
+| Slope | 5 s | 0.15 | ±1.0 | ±1.0 | ±1.0 | 使用父类默认范围 |
+| Bar | 5 s | 0.15 | −1.0 ~ 1.5 | ±1.0 | ±1.5 | |
+| Tires | 5 s | 0.15 | ±1.0 | ±1.0 | ±1.0 | 使用父类默认范围 |
+
+### 6. 各任务奖励差异（权重）
+
+公共项（`periodic_gait.py:configure_gait_rewards()`）：`gait_contact=-5`、`swing_clearance=-10`、`standing_support=+4`、`standing_joint_motion=-2`、`feet_slide=-1`；旧周期/腾空时间/固定抬腿项统一置空。
+
+| 任务 | track_lin_xy | track_ang_z | base_height_l2 | undesired_contacts | action_rate | joint_pos_limits | stand_still | upward | gait_contact / swing | 摆动高度 | 其他 |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---|
+| Flat | 45 | 40 | 0 @0.32（传感器 None，零权重被清理） | −1 | −0.2 | −10 | −2 | +1 | −5 / −10 | 0.07 | `is_terminated=-3`、`feet_contact=+1`、`contact_forces=-0.005` |
+| Flat-DomainRand | 45 | 40 | 同 Flat | −1 | −0.2 | −10 | −2 | +1 | −5 / −10 | 0.08 | 同上；域随机化开启（质量 ±0.1、质心 ±3 mm、增益 0.98–1.02） |
+| Rough | 45 | 40 | 0 @0.32 | −1 | −0.2 | −10 | −2 | +1 | −5 / −10 | 0.05 | `applied_torque_limits=-0.01`、`feet_contact=+1` |
+| Stairs | 80 | 70 | −10 @0.33 | −20（base/hip/thigh） | −1.5 | −2 | −10 | 0 | −7.5 / −15 | 0.12 | `stair_landing=-3`、`feet_stumble=-1`、`feet_distance_y=2.0` |
+| Sand | 55 | 30 | −50 @0.34 | −100（非足端） | −2.0 | −2 | −30 | 0 | −5 / −10 | 0.07 | `feet_distance_y=2.0` |
+| Slope | 70 | 65 | −5 @0.30 | −100 | −2.0 | −5 | −30 | +25 | −5 / −10 | 0.07 | `action_smoothness_2_l2=-0.3` |
+| Bar | 55 | 30 | −8 @0.30（传感器 None） | −20 | −2.0 | −5 | −30 | 0 | −5 / −10 | 0.10 | |
+| Tires | 95 | 80 | −100 @0.33 | −100 | −2.0 | −2 | −30 | 0 | −5 / −10 | 0.10 | `feet_distance_y=2.0`（std 0.15） |
+
+速度跟踪均为指数型，`std`：Flat/Rough 0.8，其余沿用父类默认。关节位置惩罚的 `stand_still_scale`：Flat/Rough 5.0，others 8.0（Tires 4.0，Stairs 4.0）。
+
+### 7. 训练超参（rsl_rl）
+
+HIM（`--agent=rsl_rl_him_cfg_entry_point`）：
+
+| 任务 | num_steps_per_env | max_iterations | save_interval | learning_rate | entropy_coef | schedule |
+|---|---:|---:|---:|---|---:|---|
+| Flat | 48 | 1000 | 50 | 5e-4 | 0.01 | adaptive |
+| Flat-DomainRand | 48 | 1000 | 50 | 5e-5 | 0.003 | fixed |
+| Stairs | 48 | 20000 | 100 | 5e-5 | 0.003 | fixed |
+| Rough / Sand / Slope | 24 | 20000 | 100 | 1e-3 | 0.01 | adaptive |
+| Bar | 24 | 5000 | 100 | 1e-3 | 0.01 | adaptive |
+| Tires | 24 | 20000 | 100 | 1e-3 | 0.01 | adaptive |
+
+- 网络：actor/critic 各 `[512, 256, 128]` + ELU，`init_noise_std=1.0`，不做观测归一化；PPO `epochs=5`、`mini_batches=4`、`clip=0.2`、`gamma=0.99`、`lam=0.95`、`desired_kl=0.01`、`max_grad_norm=1.0`。
+- HIM 估计器：`num_one_step_obs=47`、`history_length=6`、`history_order=oldest_to_latest`、encoder `[128, 64, 16]`、target `[128, 64]`、`num_prototypes=32`、`temperature=3.0`、`estimator_lr=1e-3`、`velocity_loss_coef=1.0`、`swap_loss_coef=0.1`。
+- 非 HIM 的 PPO runner：`num_steps_per_env=24`，`max_iterations` 为 Rough/Flat 2000、Bar 5000、其余 20000，`lr=1e-3`、`entropy_coef=0.01`、`adaptive`。
+- cusrl 入口：`num_steps_per_update=24`、AdamW `lr=1e-3`、`epochs=5`、`mini_batches=4`、`EntropyLoss(0.008)`、`AdaptiveLRSchedule(kl=0.01)`；迭代上限 Rough/Sand/Slope/Stairs/Tires 20000、Flat/Bar 5000。
+- `max_iterations` 可被 `--max_iterations` 覆盖（如近期 Flat 运行实际跑到 2400 轮）。
+
+### 8. 迭代耗时参考
+
+单轮耗时 ≈ `num_steps_per_env × num_envs` 的采集时间 + PPO 学习时间，与任务配置无关。4000 envs 实测：48 步/轮约 3.38 s 采集 + 0.65 s 学习（fps ≈ 47.6k），24 步/轮约 1.61 s + 0.30 s（fps ≈ 50.5k）。因此 Flat / Flat-DomainRand / Stairs 的单轮时间约为其他任务的 2 倍，总训练步数相同时墙钟时间基本一致；若要缩短单轮显示时间可把 `num_steps_per_env` 改回 24。
+
+## ATDOG2 逐任务观测明细与策略配置
+
+更新日期：2026-11-14。本节补充上一节总览中 8 个任务共用的观测项逐项定义、逐任务 policy / critic 观测对照、各任务实际挂载的传感器差异，以及三种训练器入口下的策略网络与超参。数值以当前代码以及 `logs/rsl_rl/atdog_dog2_flat_him/*/params/env.yaml`、`exported/policy_metadata.json` 的实测结果为准；本轮按 `periodic_gait.py`、各任务 `__post_init__()` 和 `stairs_rewards.py` 重新核对，Stairs 已改用 `configure_stair_rewards()` 且 `critic.height_scan=None`。
+
+### 1. 观测项逐项定义（8 个任务共用）
+
+Policy 组来自 `dog2/periodic_gait.py:ATDog2PolicyCfg()`，`configure_periodic_gait()` 在环境初始化时替换整个 policy 组、给 critic 加 `phase` 项并把 `critic.height_scan` 置 `None`；各任务随后统一把 `policy.base_lin_vel`、`policy.height_scan` 置为 `None`。`stairs_rewards.py` 不新增观测项。单帧 47 维，顺序如下：
+
+| 顺序 | Policy 项 | 来源函数 | 维度 | scale | 训练噪声（加性均匀） | clip |
+|---|---|---|---:|---|---|---|
+| 1 | `phase` | `mdp.stairs_phase`（读 `PhaseVelocityCommand.gait_clock` 的 sin/cos） | 2 | 1（配置中为 `None`，不缩放） | 无 | 无 |
+| 2 | `base_ang_vel` | `isaaclab.envs.mdp.observations.base_ang_vel` | 3 | 0.25 | ±0.2 | ±100 |
+| 3 | `projected_gravity` | `isaaclab.envs.mdp.observations.projected_gravity` | 3 | 1.0 | ±0.05 | ±100 |
+| 4 | `velocity_commands` | `mdp.generated_commands`（`base_velocity`） | 3 | `(1, 1, 0.25)` | 无 | ±100 |
+| 5 | `joint_pos` | `mdp.joint_pos_rel`（相对默认关节角） | 12 | 1.0 | ±0.01 | ±100 |
+| 6 | `joint_vel` | `mdp.joint_vel_rel` | 12 | 0.05 | ±1.5 | ±100 |
+| 7 | `actions` | `mdp.last_action` | 12 | 1.0 | 无 | ±100 |
+| — | `base_lin_vel` | 已置 `None` | — | — | — | — |
+| — | `height_scan` | 已置 `None` | — | — | — | — |
+
+- `policy.enable_corruption=True`（训练加噪）；`play.py` 评估/导出时改为 `False`。`critic.enable_corruption=False`，critic 观测不带噪声。
+- HIM 运行时 `apply_him_observation_history()` 给 policy 组设置 `history_length=6`、`flatten_history_dim=True`；Isaac Lab 先按"每个 term 独立展开历史"拼接，`HIMVecEnvWrapper._reorder_policy_history()` 再重组为按帧排列的 282 维（`oldest_to_latest`，当前帧为 `[235:282]`）。标准 PPO / cusrl 入口不启用历史，actor 输入仍是 47 维。
+- 步态时钟参数：Flat / Flat-DomainRand / Rough / Sand / Slope / Bar / Tires 使用 `TrotClockCfg()` 默认值（`cycle_time=0.7`、`duty_factor=0.6`、`transition_width=0.05`，平移门槛 0.08/0.04 m/s、偏航门槛 0.10/0.05 rad/s）；Stairs 通过 `StairsVelocityCommandCfg` 覆盖为 `cycle_time=0.5`、`duty_factor=0.55`、`transition_width=0.07`，平移与偏航门槛均为 0.05/0.025。`phase` 项读同一个时钟，因此 Stairs 的 sin/cos 频率、占空比与其他任务不同；其余任务的相位数值仍随启停规则和命令分布变化。
+
+Critic 组当前为 50 维，切片（导出时记录在 `policy_metadata.json` 的 `critic_terms`）如下：
+
+| 切片 | Critic 项 | 维度 | scale / clip | 说明 |
+|---|---|---:|---|---|
+| `[0:3]` | `base_lin_vel` | 3 | 2.0，无噪声 | 特权线速度，也是 estimator 的回归目标 `estimator_vel_slice=[0,3]` |
+| `[3:6]` | `base_ang_vel` | 3 | 0.25 | 与 policy 同名项对齐 |
+| `[6:9]` | `projected_gravity` | 3 | 1.0 | |
+| `[9:12]` | `velocity_commands` | 3 | `(1, 1, 0.25)` | |
+| `[12:24]` | `joint_pos` | 12 | 1.0 | |
+| `[24:36]` | `joint_vel` | 12 | 0.05 | |
+| `[36:48]` | `actions` | 12 | 1.0 | |
+| `[48:50]` | `phase` | 2 | 无 | 与 policy 同一时钟 |
+| — | `height_scan` | 0 | — | 全部 ATDog2 任务关闭该观测 |
+
+Estimator 的 teacher 目标项由 `RslRlHimActorCriticCfg.estimator_target_term_names` 固定为 `base_ang_vel, projected_gravity, joint_pos, joint_vel, actions, base_lin_vel`，对应 critic 切片 `[[3,6],[6,9],[12,24],[24,36],[36,48],[0,3]]`，共 45 维。
+
+### 2. 逐任务观测差异
+
+`P` 表示上表 7 项、47 维的 policy 单帧（HIM 为 `P×6=282`；标准 PPO / cusrl 为 47），`C` 表示本节上表 8 项、50 维的 critic 组。每个任务的具体观测组内容如下：
+
+| 任务 | policy 组 | critic 组 | `phase` / `velocity_commands` 实际语义 | 地形传感器与观测的关系 |
+|---|---|---|---|---|
+| Flat | `P`（47 / 282） | `C`（50） | 默认时钟 0.7/0.6/0.05；`heading_command=False`，yaw 直接采样 | `height_scanner`（187 射线）与 `height_scanner_base`（9 射线）仍挂载，但均不进入两个观测组；187 射线供摆腿净空等奖励，`base_height_l2.sensor_cfg=None` |
+| Flat-DomainRand | `P`（47 / 282） | `C`（50） | 同 Flat；命令范围 vx −0.8~1.2、vy ±0.6，站立比例 0.05；域随机化只改数值分布 | 同 Flat；`base_height_l2` 重新指向 9 射线传感器（零权重，被清理） |
+| Rough | `P`（47 / 282） | `C`（50） | 同 Flat；`rel_heading_envs=0` | 显式给 `critic.joint_pos/joint_vel` 指定 12 关节顺序；`terrain_levels` 课程不输入观测 |
+| Stairs | `P`（47 / 282） | `C`（50），`height_scan` 再次显式置 `None` | `StairsVelocityCommandCfg`（heading off），时钟 0.5/0.55/0.07；相位频率、占空比与其他任务不同 | 187 射线供 `configure_stair_rewards()` 的地形查询；9 射线供 `StairsVelocityCommand` 的进度/抬升指标；`terrain_levels_stairs` 不输入观测 |
+| Sand | `P`（47 / 282） | `C`（50） | 默认时钟；未显式关闭 `heading_command`（父类默认 `True`），yaw 由 heading 误差生成 | 187 射线供奖励，9 射线供 `base_height_l2`；都不是观测输入 |
+| Slope | `P`（47 / 282） | `C`（50） | 同 Sand | 同 Sand；坡度变化不进入观测 |
+| Bar | `P`（47 / 282） | `C`（50） | 同 Sand | `height_scanner_base=None`；`height_scanner` 由 `MySceneCfg()` 重新挂到 plane 上，仅供奖励/几何查询 |
+| Tires | `P`（47 / 282） | `C`（50） | 同 Sand | 两个射线传感器都重新挂到 `base`；均不进入观测组 |
+
+所有任务的 actor 都不接收真实机身线速度和地形高度：线速度只进 critic 并作为 estimator 回归目标；地形扫描不输入 actor 或 critic。当前各任务为 282/50 维，但跨任务仍需检查相位、缩放和 teacher 语义，不能仅凭维度相等判断可迁移（尤其 Stairs 与其他任务的相位频率不同、Sand/Slope/Bar/Tires 的 yaw 命令语义不同）。`align_him_critic_observations()` 在 HIM 启动时把 critic 的同名项替换为 policy 项的深拷贝并清除 critic 噪声（`him_clean_critic=True`），因此 HIM 下所有任务的 critic 关节顺序与 policy 一致；标准 PPO / cusrl 不调用该函数，critic 保留父类 `joint_names=".*"`（Rough 例外）。完整逐项切片和尺度见上一节「观测契约」与本节第 1 小节。
+
+### 3. 三种训练器入口的策略结构
+
+| 入口 | 类 | actor 输入 | critic 输入 | 网络 | 动作分布 |
+|---|---|---|---|---|---|
+| `rsl_rl_him_cfg_entry_point` | `HIMOnPolicyRunner` + `HIMActorCritic` / `HIMPPO` | 282 维历史（内部 actor 用 66 维） | 50 | estimator + actor `[512,256,128]` + critic `[512,256,128]`，ELU | `Normal(mean, std)`，`std` 为 12 个可学习参数、初值 1.0 |
+| `rsl_rl_cfg_entry_point`（默认） | `OnPolicyRunner` + 标准 ActorCritic | 47 维单帧 | 50（特权组） | actor / critic `[512,256,128]`，ELU | `Normal`，`init_noise_std=1.0` |
+| `cusrl_cfg_entry_point` | `cusrl.ActorCritic.Factory` | 47 维单帧 | 由 cusrl 环境包装决定 | MLP `[512,256,128]` + ELU（`ends_with_activation=True`），`cusrl.Value` | `cusrl.NormalDist` |
+
+HIM 策略的关键结构（`him_actor_critic.py` / `him_estimator.py`）：
+
+| 模块 | 输入 → 输出 | 说明 |
+|---|---|---|
+| estimator encoder | 282 → 128 → 64 → 19 | 输出前 3 维为预测机身线速度，后 16 维为 L2 归一化隐变量；`forward` 全程 `detach`，不向 actor 回传梯度 |
+| estimator target | 45 → 128 → 64 → 16 | 由下一时刻 critic 的 teacher 切片生成目标隐变量，同样 L2 归一化 |
+| actor | `47 + 3 + 16 = 66` → 512 → 256 → 128 → 12 | 输入为历史最后一帧（`actor_current_frame="last"`）+ 预测速度 + 隐变量；不是直接吃 282 维 |
+| critic | 50 → 512 → 256 → 128 → 1 | 标准状态价值函数 |
+| 原型层 | `Embedding(32, 16)` | SwAV 式 swap 预测，Sinkhorn 3 次迭代、温度 3.0 |
+
+损失与优化：PPO surrogate（`clip_param=0.2`）、clipped value loss（`value_loss_coef=1.0`）、熵正则、`desired_kl=0.01` 自适应学习率、`max_grad_norm=1.0`；estimator 独立 Adam(`lr=1e-3`, `max_grad_norm=10.0`)，损失为 `1.0 × MSE(预测线速度, critic 真实线速度) + 0.1 × swap_loss`。训练时 actor/critic/std 用 Adam(`lr` 见下表)，`num_learning_epochs=5`、`num_mini_batches=4`、`gamma=0.99`、`lam=0.95`。
+
+动作是 12 维关节位置偏移（`use_default_offset=True`），环境侧 scale 为 0.25（Flat/Flat-DomainRand 全部关节；其余 hip 0.125、thigh/calf 0.25），`clip_actions` 未启用，动作项 `clip=±100` 仅作兜底。
+
+### 4. 逐任务策略配置
+
+| 任务 | HIM runner | HIM：步数 / 迭代 / lr / entropy / schedule | 标准 PPO runner | PPO：步数 / 迭代 | cusrl trainer：步数 / 迭代 |
+|---|---|---|---|---|---|
+| Flat | `ATDogDog2FlatHIMRunnerCfg` | 48 / 1000 / 5e-4 / 0.01 / adaptive | `ATDogDog2FlatPPORunnerCfg` | 24 / 2000 | `ATDogDog2FlatTrainerCfg`：24 / 5000 |
+| Flat-DomainRand | `ATDogDog2FlatDomainRandHIMRunnerCfg` | 48 / 1000 / 5e-5 / 0.003 / fixed | `ATDogDog2FlatPPORunnerCfg` | 24 / 2000 | `ATDogDog2FlatTrainerCfg`：24 / 5000 |
+| Rough | `ATDogDog2RoughHIMRunnerCfg` | 24 / 20000 / 1e-3 / 0.01 / adaptive | `ATDogDog2RoughPPORunnerCfg` | 24 / 2000 | `ATDogDog2RoughTrainerCfg`：24 / 20000 |
+| Stairs | `ATDogDog2StairsHIMRunnerCfg` | 48 / 20000 / 5e-5 / 0.003 / fixed | `ATDogDog2StairsPPORunnerCfg` | 24 / 20000 | `ATDogDog2StairsTrainerCfg`：24 / 20000 |
+| Sand | `ATDogDog2SandHIMRunnerCfg` | 24 / 20000 / 1e-3 / 0.01 / adaptive | `ATDogDog2SandPPORunnerCfg` | 24 / 20000 | `ATDogDog2SandTrainerCfg`：24 / 20000 |
+| Slope | `ATDogDog2SlopeHIMRunnerCfg` | 24 / 20000 / 1e-3 / 0.01 / adaptive | `ATDogDog2SlopePPORunnerCfg` | 24 / 20000 | `ATDogDog2SlopeTrainerCfg`：24 / 20000 |
+| Bar | `ATDogDog2BarHIMRunnerCfg` | 24 / 5000 / 1e-3 / 0.01 / adaptive | `ATDogDog2BarPPORunnerCfg` | 24 / 5000 | `ATDogDog2BarTrainerCfg`：24 / 5000 |
+| Tires | `ATDogDog2TiresHIMRunnerCfg` | 24 / 20000 / 1e-3 / 0.01 / adaptive | `ATDogDog2TiresPPORunnerCfg` | 24 / 2000 | `ATDogDog2TiresTrainerCfg`：24 / 20000 |
+
+说明：
+
+- HIM 的 `save_interval`：Flat / Flat-DomainRand 50，其余 100；`max_iterations` 可被 `--max_iterations` 覆盖。
+- 标准 PPO 三种任务的 `lr=1e-3`、`entropy_coef=0.01`、`schedule="adaptive"` 全部相同，仅迭代上限不同。
+- cusrl 各任务统一 `AdamW(lr=1e-3)`、`epochs=5`、`mini_batches=4`、`EntropyLoss(0.008)`、`AdaptiveLRSchedule(kl=0.01)`、`gamma=0.99`、`lam=0.95`。
+- 两个 rsl_rl 入口共用 `clip_param=0.2`、`gamma=0.99`、`lam=0.95`、`desired_kl=0.01`、`max_grad_norm=1.0`、`value_loss_coef=1.0`、`use_clipped_value_loss=True`，且显式关闭观测归一化（`actor_obs_normalization=False`、`critic_obs_normalization=False`）；cusrl 的配置未启用归一化 hook。
+
+### 5. 部署侧输入契约
+
+`play.py` 导出的 `policy.pt` / `policy.onnx` 把 estimator encoder 与 actor 融合成一个模块：输入名 `obs_history`、形状 `[1, 282]`，输出名 `actions`、形状 `[1, 12]`。也就是说部署端只需喂 6 帧 47 维历史，不需要 critic 的 50 维；模块内部自行计算 3 维预测速度与 16 维隐变量，拼成 66 维 actor 输入。
+
+`policy_metadata.json` 记录 `critic_obs_dim=50`、`one_step_obs_dim=47`、`history_length=6`、`history_order=oldest_to_latest`、`history_indices_latest_to_oldest=[5,4,3,2,1,0]`、`actor_current_frame=last`、`estimator_vel_slice=[0,3]`、`estimator_target_slices`、各 policy/critic term 的切片与缩放、以及步态时钟 `gait_clock`；`gait_clock.py`、`at_robot_lab_history.yaml` 供部署端重建相位。导出时 `enable_corruption=False`，训练期的观测噪声不进入部署策略。
 
 ## 开始训练
 
@@ -257,3 +505,94 @@ cp atdog_dog2_arm_rough/2026-06-10_11-04-22  atdog_dog3_arm_rough/
 
 
 
+
+
+## ATDog2 Critic 扫描关闭及 checkpoint 输入迁移（2026-11-14）
+
+统一配置入口 `dog2/periodic_gait.py::configure_periodic_gait` 将
+`observations.critic.height_scan=None`。覆盖 Flat、Flat-DomainRand、Rough、Stairs、
+Sand、Bar、Tires、Slope，Stairs 不再重新添加扫描观测。Actor 仍为单帧 47 维、
+HIM 六帧 282 维；Critic 从历史 237 维变为 50 维。
+
+这是关闭 Critic 扫描输入，不是删除射线传感器。足端净空、台阶专用五项奖励和相关
+地形指标仍使用地形查询，不能直接删除传感器。`lazy_sensor_update=True` 时这些奖励每步访问
+`height_scanner.data`，187 条网格射线仍会每步计算；关闭观测项主要省去观测组里的裁剪/缩放/拷贝，
+实际迭代提速需测量。
+
+### HIM resume / checkpoint
+
+`HIMOnPolicyRunner.save()` 保存 `checkpoint_format_version=2`、模型、两个优化器、
+迭代计数及完整 `observation_contract`。旧 checkpoint 只要包含可验证的观测契约，
+无需重写文件即可通过原 `--resume --load_run=...` 自动迁移 Critic 输入。
+训练 resume、`--him_init_checkpoint` 和 HIM play 使用相同迁移逻辑。
+
+- 依据观测项名称及完整定义（维度、函数、缩放、裁剪、噪声、参数等）匹配第一层输入列，
+  支持增删、重排、同维度更换和非 teacher 项维度变化；同名同定义列保留。
+- 删除项对应列丢弃；新增或定义变化项的列置零。Critic 后续层和 bias 保留。
+  不按总维度或前缀盲目截取；同维度重排也会迁移。
+- Actor/历史布局、HIM teacher 字段定义和 teacher 目标顺序必须兼容。
+  `base_lin_vel` 与 teacher 项不可静默删除或改义；允许其索引随 Critic 重排变化，
+  但切片必须与契约声明一致。网络隐藏层尺寸变化不在此次迁移范围内。
+- Critic 输入变化时 PPO 优化器状态清空；teacher 语义未变时 estimator 权重和优化器保留。
+  普通 resume 保留 checkpoint 迭代计数；`--him_init_checkpoint` 的 weights-only 模式
+  从第 0 轮开始且不恢复两个优化器。完全同契约仍按原方式恢复两个优化器。
+- 旧相位/critic 噪声语义迁移仍须显式 `--him_allow_observation_migration`，
+  该选项不允许任意 Actor/teacher 语义变化。
+- 没有观测契约的历史文件仍需要 `--him_allow_legacy_checkpoint`，且无法安全推断
+  Critic 输入列的含义；不提供无契约的自动输入维度迁移。
+
+移除扫描后价值估计需要重新适应，不等价于数值完全连续的恢复；Actor 权重不会因此重置。
+新保存的 checkpoint 会记录当前 50 维契约，后续同配置恢复无需再次迁移。
+标准 RSL-RL PPO 训练保留原有按参数形状回退加载流程；它没有 HIM 观测契约，不能承诺
+按观测语义重排 Critic 列。上述自动语义迁移专用于本项目 HIM runner。
+
+验证记录：10 项 checkpoint 数值/加载测试通过；使用现有 `2026-11-13_23-22-21/model_5700.pt`
+验证 Critic 237→50 列迁移及 Actor/estimator 权重保留，未改写源 checkpoint。未为本次改动重启训练。
+
+## ATDog2 台阶迭代耗时优化与实测（2026-11-14）
+
+硬件采样：RTX 5060 Laptop 8 GB，显存约 6.7–6.9 GB，GPU 利用率多数 62–82%，
+功耗约 50 W、温度约 56–62°C。`nvidia-smi -q` 报告当前功耗上限为 50 W，
+`SW Power Cap` 生效；没有更改功耗上限、CPU powersave governor 或系统频率配置。
+
+本次保持 4000 环境、48 步/环境/迭代（192000 transitions）、PPO epochs/mini-batches、
+物理 dt/decimation、足端 72 条射线的几何精度不变：
+
+1. 五项台阶奖励不再访问 `height_scanner.data`：直接使用已初始化的 mesh，
+   初始支撑高度兜底复用四足地面高度，不再为此刷新 187 条 Critic 网格射线。
+2. 新增 `robot_lab/terrain_raycast.py`，使用上游同一 Warp kernel，显式绑定
+   PyTorch 当前 CUDA stream，避免每次射线调用后的设备级 `wp.synchronize()`。
+   CPU/跨设备输入仍回退到上游 wrapper；未修改 Isaac Lab 安装。
+3. 缓存采样偏置/索引/mesh，摆腿锁定和台阶指标初始化改用固定形状选择，减少
+   CUDA 布尔索引同步及每步常量分配。
+
+每组均取运行末尾 20 轮，以下是顺序训练测量，受地形分布、负载与频率变化影响，
+不能将全部差异归因于单一改动：
+
+|阶段/运行目录|平均采集|平均学习|平均迭代|迭代范围|
+|---|---:|---:|---:|---:|
+|改动前 `2026-11-14_04-21-56`|7.334 s|0.844 s|8.178 s|7.758–9.330 s|
+|移除多余扫描/布尔索引同步 `2026-11-14_12-41-06`|6.780 s|0.837 s|7.617 s|7.507–7.750 s|
+|再启用同 stream 射线 `2026-11-14_13-01-41`|6.690 s|0.834 s|7.524 s|7.432–7.623 s|
+
+总迭代平均缩短约 8%，吞吐从约 2.35 万提高到约 2.55 万 transitions/s。
+`ROBOT_LAB_PROFILE=1` 的分段计时显示环境仍是主要开销；Actor 和 post 合计约 0.10 s。
+当前训练从上一轮已保存的 `model_9700.pt` 恢复，日志在容器
+`/tmp/atdog2_speed_async_training.log`。这些优化不改变 Actor/Critic 输入维度，
+可继续使用既有 checkpoint。机身高度首次初始化兜底的地形参考略有变化，已在奖励设计中说明。
+
+验证：10 项台阶奖励测试（含禁止读取网格 scanner 的回归检查）通过；
+`tests/check_terrain_raycast_stream.py` 的 16 批随机 CUDA 查询在默认和非默认 stream
+下与上游的命中点/法线一致；语法与 `git diff --check` 通过。
+
+### 当前运行日志驱动的权重修订（2026-11-15）
+
+读取运行中 `2026-11-15_00-57-37` 的 1121–1220 次窗口：
+线速度误差 .3415、楼梯进展 .9883 m、成功率 31.20%、非法接触 23.63%；
+joint_acc 惩罚约 −38.45，明显大于五项楼梯惩罚。
+默认 Dog2 楼梯任务调整 joint_acc −1e−5→−7.5e−6、yaw tracking +50→+25、
+越边 −3→−5、落足 −2→−3、支撑稳定 −1→−2。
+保留线速度、动态摆腿/机身高度、动作平滑及接触/姿态保护。
+当前进程不热更新，改动下次新启动/resume 生效；未打断现有训练。
+不以改权重后的总奖励判断改善；需固定高度验证成功率和摔倒率。
+详见 `docs/ATDOG2_REWARD_HIM_AUDIT.md` 的本次快照与调整记录。

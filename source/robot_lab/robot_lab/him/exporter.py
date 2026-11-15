@@ -78,7 +78,10 @@ def _build_him_deployment_metadata(actor_critic, env) -> dict[str, object]:
         "estimator_vel_slice": list(actor_critic.vel_slice),
         "estimator_target_slices": [list(part) for part in actor_critic.target_slices],
         "actor_current_frame": getattr(actor_critic, "actor_current_frame", "first"),
-        "history_layout": "time_major_current_to_oldest",
+        "history_layout": (
+            "time_major_oldest_to_current" if getattr(actor_critic, "actor_current_frame", "first") == "last"
+            else "time_major_current_to_oldest"
+        ),
     }
     if env is None or not hasattr(env, "get_him_deployment_metadata"):
         return metadata

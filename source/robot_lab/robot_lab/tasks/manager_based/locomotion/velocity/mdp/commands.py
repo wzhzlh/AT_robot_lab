@@ -70,18 +70,48 @@ class PhaseVelocityCommand(mdp.UniformVelocityCommand):
     def __init__(self, cfg: PhaseVelocityCommandCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         self.gait_clock = TrotClock(self.num_envs, self.device, cfg.gait)
+        self._velocity_error_sum = torch.zeros(self.num_envs, 2, device=self.device)
+        self._velocity_error_samples = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+    def _update_metrics(self):
+        # Average the samples actually collected since this environment's reset,
+        # independently of command duration and other environments' lifetimes.
+        self._velocity_error_sum[:, 0] += torch.linalg.vector_norm(
+            self.vel_command_b[:, :2] - self.robot.data.root_lin_vel_b[:, :2], dim=-1
+        )
+        self._velocity_error_sum[:, 1] += (
+            self.vel_command_b[:, 2] - self.robot.data.root_ang_vel_b[:, 2]
+        ).abs()
+        self._velocity_error_samples += 1
+        count = self._velocity_error_samples.clamp_min(1)
+        self.metrics["error_vel_xy"].copy_(self._velocity_error_sum[:, 0] / count)
+        self.metrics["error_vel_yaw"].copy_(self._velocity_error_sum[:, 1] / count)
 
     @property
     def gait_phase(self):
         return self.gait_clock.phase
 
     def _update_command(self):
-        super()._update_command()
+        if self.cfg.heading_command:
+            # Retain the upstream heading controller for heading-based tasks.
+            super()._update_command()
+        else:
+            # Same zero-command rule, without nonzero() synchronizing CUDA.
+            self.vel_command_b.masked_fill_(self.is_standing_env[:, None], 0.0)
         self.gait_clock.update(self.vel_command_b, self._env.step_dt)
 
     def reset(self, env_ids: Sequence[int] | None = None):
-        metrics = super().reset(env_ids)
-        self.gait_clock.reset(env_ids)
+        ids = torch.arange(self.num_envs, device=self.device) if env_ids is None else env_ids
+        # Follow CommandTerm.reset's reduction/reset/resample order, but leave
+        # scalars on-device for the runner's batched log transfer.
+        metrics = {name: value[ids].mean() for name, value in self.metrics.items()}
+        for value in self.metrics.values():
+            value[ids] = 0.0
+        self.command_counter[ids] = 0
+        self._resample(ids)
+        self._velocity_error_sum[ids] = 0
+        self._velocity_error_samples[ids] = 0
+        self.gait_clock.reset(ids)
         return metrics
 
 
@@ -105,10 +135,6 @@ class StairsVelocityCommand(PhaseVelocityCommand):
         self._start_xy = torch.zeros(self.num_envs, 2, device=self.device)
         self._start_height = torch.zeros(self.num_envs, device=self.device)
         self._travel_direction = torch.zeros_like(self._start_xy)
-        self._contact_sensor = env.scene.sensors["contact_forces"]
-        # Per-body rates identify actual collision sources without weakening penalties.
-        for name in self._contact_sensor.body_names:
-            self.metrics[f"contact_rate/{name}"] = torch.zeros(self.num_envs, device=self.device)
 
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
@@ -132,10 +158,6 @@ class StairsVelocityCommand(PhaseVelocityCommand):
 
     def _update_metrics(self):
         super()._update_metrics()
-        forces = self._contact_sensor.data.net_forces_w_history
-        contacts = forces.norm(dim=-1).amax(dim=1) > 1.0
-        for index, name in enumerate(self._contact_sensor.body_names):
-            self.metrics[f"contact_rate/{name}"] += contacts[:, index].float()
         command = self.vel_command_b[:, :2]
         speed = torch.linalg.norm(command, dim=1)
         moving = speed > self.cfg.min_command_speed
@@ -146,9 +168,10 @@ class StairsVelocityCommand(PhaseVelocityCommand):
         ground = self._env.scene.sensors["height_scanner_base"].data.ray_hits_w[..., 2].median(dim=1).values
         position = self.robot.data.root_pos_w[:, :2]
         initialize = moving & ~self._start_valid & torch.isfinite(ground)
-        self._start_xy[initialize] = position[initialize]
-        self._start_height[initialize] = ground[initialize]
-        self._start_valid[initialize] = True
+        # Fixed-size selections avoid CUDA nonzero/host synchronization.
+        self._start_xy.copy_(torch.where(initialize[:, None], position, self._start_xy))
+        self._start_height.copy_(torch.where(initialize, ground, self._start_height))
+        self._start_valid |= initialize
         displacement = ((position - self._start_xy) * self._travel_direction).sum(dim=1)
         self.metrics["stair_progress"] = torch.where(
             self._start_valid, displacement.clamp_min(0.0), 0.0
@@ -171,13 +194,12 @@ class StairsVelocityCommand(PhaseVelocityCommand):
             eligible, failed, self.cfg.success_distance, self.cfg.min_height_change,
         )
         stair_success = (success & eligible).float().sum() / eligible.float().sum().clamp_min(1)
-        episode_steps = self._env.episode_length_buf[ids].clamp_min(1)
-        for name in self._contact_sensor.body_names:
-            self.metrics[f"contact_rate/{name}"][ids] /= episode_steps
         metrics = super().reset(env_ids)
-        metrics["stair_success"] = stair_success.item()
-        metrics["stair_eligible_count"] = eligible.sum().item()
-        metrics["stair_success_count"] = success.sum().item()
+        # Device scalars: the logger accepts tensors, and a per-reset .item()
+        # would force one host sync for each metric on every reset step.
+        metrics["stair_success"] = stair_success
+        metrics["stair_eligible_count"] = eligible.sum()
+        metrics["stair_success_count"] = success.sum()
         self._had_translation[ids] = False
         self._start_valid[ids] = False
         return metrics

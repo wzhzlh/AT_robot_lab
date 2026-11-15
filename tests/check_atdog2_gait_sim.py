@@ -23,6 +23,7 @@ import tempfile
 import traceback
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import gymnasium as gym
 import torch
@@ -66,7 +67,8 @@ def main():
         for removed in ("periodic_foot_lift", "feet_gait", "diagonal_trot_contact_pattern", "feet_height",
                         "feet_height_body", "feet_height_body_exp", "feet_contact_without_cmd", "feet_air_time"):
             assert getattr(cfg.rewards, removed) is None, (cls.__name__, removed)
-        assert cfg.commands.base_velocity.gait == TrotClockCfg()
+        expected_gait = TrotClockCfg(transition_width=0.08) if cls is ATDogDog2StairsEnvCfg else TrotClockCfg()
+        assert cfg.commands.base_velocity.gait == expected_gait
         print("CONFIG_OK", cls.__name__)
 
     cfg = ATDogDog2FlatEnvCfg() if args.terrain == "flat" else ATDogDog2StairsEnvCfg()
@@ -126,6 +128,46 @@ def main():
             )
             penalty = mdp.standing_yaw_drift(fake_env, "base_velocity", 0.15)
             torch.testing.assert_close(penalty, torch.tensor([0., 1., 1., 0.], device=raw.device))
+        else:
+            assert "stair_landing" in raw.reward_manager.active_terms
+            assert not any(name.startswith("contact_rate/") for name in term.metrics)
+            # Shared rays must preserve landing values, avoid the second query,
+            # and never reuse geometry after a reset or a step change.
+            from robot_lab.tasks.manager_based.locomotion.velocity.mdp import rewards as reward_module
+            swing_cfg = raw.reward_manager.get_term_cfg("swing_clearance")
+            landing_cfg = raw.reward_manager.get_term_cfg("stair_landing")
+            ray_heights = []
+            original_raycast = reward_module.raycast_mesh
+
+            def record_raycast(*ray_args, **ray_kwargs):
+                result = original_raycast(*ray_args, **ray_kwargs)
+                ray_heights.append(result[0][..., 2])
+                return result
+
+            with torch.inference_mode(), patch.object(
+                reward_module, "raycast_mesh", side_effect=record_raycast
+            ) as rays:
+                swing_cfg.func(raw, **swing_cfg.params)
+                cached_landing = landing_cfg.func(raw, **landing_cfg.params)
+                assert rays.call_count == 1, rays.call_count
+                raw._gait_terrain_cache = None
+                independent_landing = landing_cfg.func(raw, **landing_cfg.params)
+                assert rays.call_count == 2, rays.call_count
+                torch.testing.assert_close(ray_heights[0][..., :5], ray_heights[1], rtol=0, atol=0)
+                torch.testing.assert_close(cached_landing, independent_landing, rtol=0, atol=0)
+                swing_cfg.func(raw, **swing_cfg.params)
+                landing_cfg.func.reset()
+                assert raw._gait_terrain_cache is None
+                swing_cfg.func(raw, **swing_cfg.params)
+                cache = raw._gait_terrain_cache
+                raw._gait_terrain_cache = (cache[0] - 1, *cache[1:])
+                calls_before = rays.call_count
+                landing_cfg.func(raw, **landing_cfg.params)
+                assert rays.call_count == calls_before + 1
+            print("TERRAIN_CACHE_OK: exact landing reward, 2 ray queries -> 1, reset/step invalidation")
+            # Exercise completed-episode success reset paths.
+            with torch.inference_mode():
+                raw.reset()
 
         actor = HIMActorCritic(
             num_actor_obs=282, num_one_step_obs=47, num_critic_obs=wrapper.num_privileged_obs, num_actions=12,
@@ -150,7 +192,7 @@ def main():
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             deploy = module.TrotClock.from_metadata(1, "cpu", meta["gait_clock"])
-            reference = TrotClock(1, "cpu", TrotClockCfg())
+            reference = TrotClock(1, "cpu", term.gait_clock.cfg)
             for command in ([0.5, 0, 0], [0, 0, 0.4], [0, 0, 0], [0, 0, 0]):
                 for _ in range(17):
                     values = torch.tensor([command], dtype=torch.float32)

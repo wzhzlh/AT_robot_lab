@@ -17,6 +17,51 @@ spec.loader.exec_module(gait)
 
 
 class GaitTests(unittest.TestCase):
+    def test_reference_sine_profile_lifts_earlier_without_changing_peak(self):
+        progress = torch.tensor([[0.0, 0.25, 0.5, 1.0]])
+        valid = torch.ones_like(progress, dtype=torch.bool)
+        weight = torch.ones_like(progress)
+        active = torch.ones(1, dtype=torch.bool)
+        height, std = 0.10, 0.10
+        expected = (height * torch.sin(math.pi * progress) / std).square().mean(dim=-1)
+        actual = gait.swing_clearance_error(
+            torch.zeros_like(progress), progress, weight, valid, active, height, std, profile="sin",
+        )
+        torch.testing.assert_close(actual, expected)
+        squared = gait.swing_clearance_error(
+            torch.zeros_like(progress), progress, weight, valid, active, height, std,
+        )
+        self.assertGreater(actual.item(), squared.item())
+        with self.assertRaises(ValueError):
+            gait.swing_clearance_error(progress, progress, weight, valid, active, height, std, profile="bad")
+
+    def test_stair_clearance_allows_extra_lift_and_ignores_invalid_rays(self):
+        clearance = torch.tensor([[0.0], [0.12], [0.20], [float("inf")]])
+        progress = torch.full_like(clearance, 0.5)
+        swing = torch.ones_like(clearance)
+        active = torch.ones(4, dtype=torch.bool)
+        error = gait.swing_clearance_error(
+            clearance, progress, swing, torch.isfinite(clearance), active, 0.12, 0.06, True,
+        )
+        torch.testing.assert_close(error, torch.tensor([4.0, 0.0, 0.0, 0.0]))
+
+    def test_loaded_edge_flat_tread_airborne_and_missed_rays(self):
+        heights = torch.tensor([[[0.0, 0.05, 0.0]], [[0.05, 0.05, 0.05]],
+                                [[0.0, 0.05, 0.0]], [[float("inf"), 0, 0]]])
+        contact = torch.tensor([[True], [True], [False], [True]])
+        error = gait.stair_edge_error(heights, contact, torch.ones(4, dtype=torch.bool), 0.015)
+        torch.testing.assert_close(error, torch.tensor([1.0, 0.0, 0.0, 0.0]))
+
+    def test_stair_success_excludes_falls_flat_standing_and_short_traversal(self):
+        progress = torch.tensor([2.2, 2.2, 2.2, 1.0, 2.2])
+        height = torch.tensor([0.1, 0.1, 0.1, 0.1, 0.02])
+        eligible = torch.tensor([True, True, False, True, True])
+        failed = torch.tensor([False, True, False, False, False])
+        self.assertEqual(
+            gait.stair_traversal_success(progress, height, eligible, failed, 2.1, 0.06).tolist(),
+            [True, False, False, False, False],
+        )
+
     def test_slower_default_clock_and_quiet_joint_gating(self):
         clock = gait.TrotClock(1, "cpu", gait.TrotClockCfg())
         for _ in range(35):

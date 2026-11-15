@@ -35,12 +35,20 @@ def reset_root_state_at_stair_edge(
     device = env.scene[asset_cfg.name].device
     terrain = env.scene.terrain
     patch_mask = terrain.cfg.terrain_generator.flat_patch_mask
-    if len(patch_mask) != terrain.cfg.terrain_generator.num_rows * terrain.cfg.terrain_generator.num_cols:
-        raise RuntimeError("Stair terrain patch metadata does not match the generated terrain")
-    patch_mask = torch.as_tensor(patch_mask, device=device).reshape(
-        terrain.cfg.terrain_generator.num_rows, terrain.cfg.terrain_generator.num_cols
-    )
-    flat = patch_mask[terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]]
+    # The mask is a Python list regenerated only with the terrain, so the host-to-device
+    # copy is cached instead of repeating on every reset.
+    cached_mask = getattr(env, "_stair_patch_mask_cache", None)
+    if cached_mask is None or cached_mask[0] is not patch_mask:
+        if len(patch_mask) != terrain.cfg.terrain_generator.num_rows * terrain.cfg.terrain_generator.num_cols:
+            raise RuntimeError("Stair terrain patch metadata does not match the generated terrain")
+        cached_mask = (
+            patch_mask,
+            torch.as_tensor(patch_mask, device=device).reshape(
+                terrain.cfg.terrain_generator.num_rows, terrain.cfg.terrain_generator.num_cols
+            ),
+        )
+        env._stair_patch_mask_cache = cached_mask
+    flat = cached_mask[1][terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]]
     if not hasattr(env, "_stair_flat_mask"):
         env._stair_flat_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
         env._stair_spawn_direction = torch.zeros(env.num_envs, 2, device=device)

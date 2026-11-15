@@ -76,6 +76,11 @@ class HIMVecEnvWrapper:
         self._terminal_critic_valid = None
         self._last_dones = None
         self._capture_terminal = False
+        # Reused rollout buffers: rebuilding these per step costs a kernel each.
+        self._policy_history_index: torch.Tensor | None = None
+        self._policy_history_index_built = False
+        self._next_critic_buffer: torch.Tensor | None = None
+        self._estimator_valid_buffer: torch.Tensor | None = None
 
         actor_obs, critic_obs = self._split_observations(self._wrapped_env.get_observations())
         self._cache_observations(actor_obs, critic_obs)
@@ -182,21 +187,32 @@ class HIMVecEnvWrapper:
         HIM修复：保留terminal transition的监督，不通过dones排除样本。
         关键改变：对于done环境，使用capture的terminal观测，并标记为有效。
         """
-        next_obs = self.get_critic_observations().clone()
-        valid = torch.ones(self.num_envs, device=next_obs.device, dtype=torch.bool)
+        latest = self.get_critic_observations()
+        next_obs = self._next_critic_buffer
+        if next_obs is None or next_obs.shape != latest.shape or next_obs.device != latest.device:
+            next_obs = torch.empty_like(latest)
+            self._next_critic_buffer = next_obs
+        next_obs.copy_(latest)
 
         # 如果有terminal观测被捕捉（环境在reset前的观测），用它替换
         if self._terminal_critic_valid is not None:
-            next_obs[self._terminal_critic_valid] = self._terminal_critic_obs[self._terminal_critic_valid]
+            # where/out avoids the host sync that boolean-mask assignment triggers.
+            torch.where(
+                self._terminal_critic_valid.unsqueeze(-1),
+                self._terminal_critic_obs,
+                next_obs,
+                out=next_obs,
+            )
 
         # ✅ 关键修改：保留所有terminal样本（包括done和not done的）
         # 旧逻辑会排除所有done的样本，现在改为全部保留
         # 即使done=True，只要被capture到terminal观测，也作为有效样本参与estimator训练
-        if self._last_dones is not None and self._terminal_critic_valid is not None:
-            # 对于done但被成功capture的环境，标记为有效
-            # valid保持为True，让estimator学习terminal supervision
-            pass  # 所有样本都保留valid=True，不主动排除任何done的样本
-
+        valid = self._estimator_valid_buffer
+        if valid is None or valid.numel() != self.num_envs or valid.device != next_obs.device:
+            valid = torch.ones(self.num_envs, device=next_obs.device, dtype=torch.bool)
+            self._estimator_valid_buffer = valid
+        else:
+            valid.fill_(True)
         return next_obs, valid
 
     def _install_terminal_capture(self):
@@ -382,8 +398,20 @@ class HIMVecEnvWrapper:
             raise ValueError(
                 f"HIM policy observation layout width {policy_width} does not match actor width {actor_obs.shape[-1]}."
             )
+        if not self._policy_history_index_built:
+            self._policy_history_index = self._build_policy_history_index()
+            self._policy_history_index_built = True
+        index = self._policy_history_index
+        if index is None:
+            return actor_obs
+        if index.device != actor_obs.device:
+            index = index.to(actor_obs.device)
+            self._policy_history_index = index
+        # One gather replaces one cat per term per history frame.
+        return actor_obs.index_select(-1, index)
 
-        term_histories = []
+    def _build_policy_history_index(self) -> torch.Tensor | None:
+        term_layouts = []
         history_lengths = set()
         for term_name, term_slice in self.policy_term_slices.items():
             one_step_slice = self.policy_one_step_term_slices[term_name]
@@ -396,19 +424,21 @@ class HIMVecEnvWrapper:
                 )
             history_length = total_dim // base_dim
             history_lengths.add(history_length)
-            term_histories.append(actor_obs[:, term_slice].reshape(actor_obs.shape[0], history_length, base_dim))
-
+            term_layouts.append((term_slice.start, base_dim))
         if len(history_lengths) != 1:
             raise ValueError(f"HIM requires a uniform policy history length, got {sorted(history_lengths)}.")
         history_length = history_lengths.pop()
         if history_length <= 1:
-            return actor_obs
-
-        frames = []
-        history_indices = range(history_length - 1, -1, -1) if self.history_order == "latest_to_oldest" else range(history_length)
+            return None
+        history_indices = (
+            range(history_length - 1, -1, -1) if self.history_order == "latest_to_oldest" else range(history_length)
+        )
+        index = []
         for history_index in history_indices:
-            frames.append(torch.cat([term_history[:, history_index] for term_history in term_histories], dim=-1))
-        return torch.cat(frames, dim=-1)
+            for term_start, base_dim in term_layouts:
+                start = term_start + history_index * base_dim
+                index.extend(range(start, start + base_dim))
+        return torch.tensor(index, dtype=torch.long)
 
     def _history_layout(self) -> str:
         return "time_major_current_to_oldest" if self.history_order == "latest_to_oldest" else "time_major_oldest_to_current"

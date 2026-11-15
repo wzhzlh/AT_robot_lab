@@ -36,6 +36,8 @@ class ATDog2PolicyCfg(ObsGroup):
 
 def configure_periodic_gait(env_cfg):
     env_cfg.observations.policy = ATDog2PolicyCfg()
+    # Shared by every Dog2 terrain task (including Flat/FlatDomainRand).
+    env_cfg.observations.critic.height_scan = None
     env_cfg.observations.critic.phase = ObsTerm(func=mdp.stairs_phase, params={"command_name": "base_velocity"})
     env_cfg.observations.policy.velocity_commands.scale = (1.0, 1.0, 0.25)
     env_cfg.observations.critic.velocity_commands.scale = (1.0, 1.0, 0.25)
@@ -45,7 +47,7 @@ def configure_periodic_gait(env_cfg):
     env_cfg.him_clean_critic = True
 
 
-def configure_gait_rewards(env_cfg, swing_height: float = 0.10):
+def configure_gait_rewards(env_cfg, swing_height: float = 0.15):
     """Apply after terrain reward overrides, before zero-weight cleanup.
 
     Keep the 47-D policy contract; all gait terms consume the command clock.
@@ -68,7 +70,7 @@ def configure_gait_rewards(env_cfg, swing_height: float = 0.10):
     )
     env_cfg.rewards.swing_clearance = RewTerm(
         func=mdp.SwingClearancePenalty,
-        weight=-10.0,
+        weight=-70.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=list(FOOT_NAMES), preserve_order=True),
             "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -77,7 +79,7 @@ def configure_gait_rewards(env_cfg, swing_height: float = 0.10):
             "foot_radius": 0.0384,
             "foot_half_width": 0.014,
             "height": swing_height,
-            "std": 0.10,
+            "std": 0.15,
         },
     )
     env_cfg.rewards.standing_support = RewTerm(
@@ -92,7 +94,7 @@ def configure_gait_rewards(env_cfg, swing_height: float = 0.10):
     )
     env_cfg.rewards.standing_joint_motion = RewTerm(
         func=mdp.standing_joint_motion,
-        weight=-2.0,
+        weight=-5.0,
         params={
             "command_name": "base_velocity",
             "asset_cfg": SceneEntityCfg("robot", joint_names=env_cfg.joint_names, preserve_order=True),
@@ -100,7 +102,7 @@ def configure_gait_rewards(env_cfg, swing_height: float = 0.10):
     )
     env_cfg.rewards.feet_slide = RewTerm(
         func=mdp.gait_foot_slide,
-        weight=-1.0,
+        weight=-5.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=list(FOOT_NAMES), preserve_order=True),
             "asset_cfg": SceneEntityCfg("robot", body_names=list(FOOT_NAMES), preserve_order=True),
