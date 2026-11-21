@@ -84,6 +84,7 @@ class HIMOnPolicyRunner:
         self.tot_time = 0.0
         self.current_learning_iteration = 0
         self.latest_episode_metrics: dict[str, float] = {}
+        self.latest_curriculum_metrics: dict[str, float] = {}
         self.latest_mean_reward: float | None = None
         self.latest_mean_episode_length: float | None = None
         # Each window entry stores (sum, count) per metric key, so the running
@@ -569,6 +570,9 @@ class HIMOnPolicyRunner:
         mean_noise_std = self.alg.actor_critic.std.mean().item()
         self._push_episode_metric_batch(self._episode_metric_batch(ep_infos))
         episode_metrics = self._episode_metric_averages()
+        curriculum_metrics = self._latest_curriculum_values(ep_infos)
+        self.latest_curriculum_metrics.update(curriculum_metrics)
+        weighted_success = self._weighted_stair_success()
         if mean_reward is not None:
             self.latest_mean_reward = mean_reward
         if mean_episode_length is not None:
@@ -611,6 +615,10 @@ class HIMOnPolicyRunner:
                 self.writer.add_scalar(f"Perf/{name}_time", value, iteration)
             for key, value in display_episode_metrics:
                 self.writer.add_scalar(key, value, iteration)
+            for key, value in self.latest_curriculum_metrics.items():
+                self.writer.add_scalar(key, value, iteration)
+            if weighted_success is not None:
+                self.writer.add_scalar("Metrics/base_velocity/stair_success_weighted", weighted_success, iteration)
 
         width = 80
         pad = 35
@@ -633,6 +641,10 @@ class HIMOnPolicyRunner:
         )
         for key, value in display_episode_metrics:
             log_string += f"{key:>{pad}}: {value:.4f}\n"
+        for key, value in self.latest_curriculum_metrics.items():
+            log_string += f"{key:>{pad}}: {value:.4f}\n"
+        if weighted_success is not None:
+            log_string += f"{'Stair success (eligible-weighted)':>{pad}}: {weighted_success:.4f}\n"
         for name, value in (profile_times or {}).items():
             log_string += f"{('Profile ' + name + ' time:'):>{pad}} {value * 1e3:.3f}ms\n"
         log_string += (
@@ -663,13 +675,32 @@ class HIMOnPolicyRunner:
         ep_info = infos.get("log")
         if not isinstance(ep_info, dict):
             return None
-        return {key: value for key, value in ep_info.items() if key.startswith(("Episode", "Metrics/"))}
+        return {key: value for key, value in ep_info.items() if key.startswith(("Episode", "Metrics/", "Curriculum/"))}
 
     def _update_episode_metric_cache(self, ep_info: dict | None):
         if not ep_info:
             return
         for key, value in self._aggregate_episode_infos([ep_info]):
             self.latest_episode_metrics[key] = value
+        self.latest_curriculum_metrics.update(self._latest_curriculum_values([ep_info]))
+
+    @staticmethod
+    def _latest_curriculum_values(ep_infos: list[dict]) -> dict[str, float]:
+        latest = {}
+        for info in ep_infos:
+            latest.update({key: value for key, value in info.items() if key.startswith("Curriculum/")})
+        if not latest:
+            return {}
+        batch = HIMOnPolicyRunner._episode_metric_batch([{key[len("Curriculum/"):]: value
+                                                         for key, value in latest.items()}])
+        return {"Curriculum/" + key: total / count for key, (total, count) in batch.items() if count}
+
+    def _weighted_stair_success(self) -> float | None:
+        success = self._episode_metric_totals.get("Metrics/base_velocity/stair_success_count")
+        eligible = self._episode_metric_totals.get("Metrics/base_velocity/stair_eligible_count")
+        if success is None or eligible is None or eligible[0] <= 0:
+            return None
+        return success[0] / eligible[0]
 
     def _aggregate_episode_infos(
         self, ep_infos: list[dict[str, torch.Tensor | float | int]]
@@ -689,7 +720,12 @@ class HIMOnPolicyRunner:
         grouped: dict[str, list] = {}
         for ep_info in ep_infos:
             for key, value in ep_info.items():
+                if key.startswith("Curriculum/"):
+                    continue
                 grouped.setdefault(key, []).append(value)
+
+        if not grouped:
+            return {}
 
         pieces: list[torch.Tensor] = []
         spans: dict[str, tuple[int, int]] = {}

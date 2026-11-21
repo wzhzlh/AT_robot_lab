@@ -24,9 +24,9 @@ class ATDog2StairsTerrainGenerator(terrain_gen.TerrainGenerator):
             self._add_sub_terrain(mesh, origin, row, col, patches[int(kind)])
 
     def _generate_curriculum_terrains(self):
-        """Generate rows from 4 cm to 12 cm for terrain-level curriculum."""
-        proportions = np.array([cfg.proportion for cfg in self.cfg.sub_terrains.values()])
-        proportions /= proportions.sum()
+        """Generate curriculum rows using configured heights and terrain ratios."""
+        proportions = np.array([self.cfg.flat_ratio, (1 - self.cfg.flat_ratio) * self.cfg.up_ratio,
+                                (1 - self.cfg.flat_ratio) * (1 - self.cfg.up_ratio)])
         sub_indices = [int(np.min(np.where(col / self.cfg.num_cols + 0.001 < np.cumsum(proportions))))
                        for col in range(self.cfg.num_cols)]
         configs = list(self.cfg.sub_terrains.values())
@@ -38,7 +38,8 @@ class ATDog2StairsTerrainGenerator(terrain_gen.TerrainGenerator):
                 is_flat = sub_index == 0
                 if hasattr(cfg, "step_height_range"):
                     fraction = row / max(self.cfg.num_rows - 1, 1)
-                    height = 0.04 + 0.08 * fraction
+                    low, high = cfg.step_height_range
+                    height = low + (high - low) * fraction
                     cfg.step_height_range = (height, height)
                 flat_mask[row, col] = is_flat
                 mesh, origin = self._get_terrain_mesh(row / max(self.cfg.num_rows - 1, 1), cfg)

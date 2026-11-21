@@ -149,7 +149,7 @@ class ATDogDog2FlatDomainRandHIMRunnerCfg(ATDogDog2FlatHIMRunnerCfg):
 
 @configclass
 class ATDogDog2StairsHIMRunnerCfg(ATDogDog2FlatDomainRandHIMRunnerCfg):
-    """Continue the shared 282-D policy through the stair stage."""
+    """Continue the shared phase-free policy through the stair stage."""
 
     def __post_init__(self):
         super().__post_init__()

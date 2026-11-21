@@ -13,7 +13,14 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from robot_lab.assets.atdog import AT_DOG2_CFG
 from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
-from .periodic_gait import configure_gait_rewards, configure_periodic_gait
+from .periodic_gait import configure_periodic_gait
+from isaaclab.managers import ObservationGroupCfg as ObsGroup, ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import ObservationsCfg, RewardsCfg
+from .observations import calf_vertical_contact_forces
+from .phase_observations import CSDog1Phase, previous_action, velocity_commands
+from .rewards import (CommandedGaitReward, PhaseSwingClearance, standing_contact,
+                      standing_joint_velocity, standing_posture, standing_base_velocity)
 from .rough_env_cfg import ATDogDog2RoughEnvCfg
 
 
@@ -24,7 +31,7 @@ def tire_array_terrain(
     meshes, origin = mesh_terrains.flat_terrain(difficulty, cfg)
     outer_radius = 0.275
     inner_radius = 0.165
-    tire_width = 0.165
+    tire_width = 0.105
     # Keep the collision mesh light; high segment counts multiply across every tire and terrain tile.
     segments = 12
     angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False)
@@ -106,6 +113,213 @@ DOG2_TIRE_ARRAY_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
         "tire_array": MeshTireArrayTerrainCfg(proportion=1.0),
     },
 )
+
+
+def tires_csdog1_phase_term():
+    return ObsTerm(func=CSDog1Phase, params={
+        "command_name": "base_velocity", "cycle_time": 0.5, "stop_cycle_time": 0.5,
+        "stop_duration": 0.5, "translation_threshold": 0.05, "yaw_threshold": 0.05,
+    }, clip=(-1.0, 1.0), scale=1.0)
+
+
+def tires_configure_dog2_phase_swing_reward(cfg):
+    cfg.rewards.phase_swing_clearance = RewTerm(
+        func=PhaseSwingClearance,
+        # 摆动相足端高度误差惩罚
+        weight=-2000.0,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["FL_calf", "FR_calf", "RL_calf", "RR_calf"], preserve_order=True,
+            ),
+            "command_name": "base_velocity",
+            "cycle_time": 0.5,
+            "stop_cycle_time": 0.5,
+            "stop_duration": 0.5,
+            "translation_threshold": 0.05,
+            "yaw_threshold": 0.05,
+            "phase_offset": 0.5,
+            "stance_ratio": 0.55,
+            "contact_smoothing": 0.07,
+            "foot_radius": 0.02,
+            "swing_height": 0.175,
+            "turn_height_bonus": 0.02,
+        },
+    )
+
+
+@configclass
+class tires_CSDog1PolicyCfg(ObsGroup):
+    phase = tires_csdog1_phase_term()
+    base_ang_vel = ObservationsCfg.PolicyCfg().base_ang_vel
+    projected_gravity = ObservationsCfg.PolicyCfg().projected_gravity
+    velocity_commands = ObservationsCfg.PolicyCfg().velocity_commands
+    joint_pos = ObservationsCfg.PolicyCfg().joint_pos
+    joint_vel = ObservationsCfg.PolicyCfg().joint_vel
+    actions = ObsTerm(func=previous_action, clip=(-100.0, 100.0), scale=1.0)
+    enable_corruption = True
+    concatenate_terms = True
+
+
+def tires_configure_observations(cfg):
+    """Add the shared phase frame and available Dog2 critic privileges."""
+    policy = tires_CSDog1PolicyCfg()
+    policy.base_ang_vel.scale = 0.25
+    policy.base_ang_vel.clip = (-400.0, 400.0)
+    policy.joint_vel.scale = 0.05
+    policy.joint_vel.clip = (-2000.0, 2000.0)
+    policy.velocity_commands.scale = (1.0, 1.0, 0.25)
+    policy.velocity_commands.func = velocity_commands
+    policy.velocity_commands.clip = None
+    policy.joint_pos.params["asset_cfg"].joint_names = cfg.joint_names
+    policy.joint_vel.params["asset_cfg"].joint_names = cfg.joint_names
+    cfg.observations.policy = policy
+
+    critic = cfg.observations.critic
+    critic.phase = tires_csdog1_phase_term()
+    critic.base_ang_vel.scale = 0.25
+    critic.base_ang_vel.clip = (-400.0, 400.0)
+    critic.joint_vel.scale = 0.05
+    critic.joint_vel.clip = (-2000.0, 2000.0)
+    critic.velocity_commands.scale = (1.0, 1.0, 0.25)
+    critic.velocity_commands.func = velocity_commands
+    critic.velocity_commands.clip = None
+    critic.actions.func = previous_action
+    critic.joint_pos.params["asset_cfg"].joint_names = cfg.joint_names
+    critic.joint_vel.params["asset_cfg"].joint_names = cfg.joint_names
+    critic.calf_contact_forces = ObsTerm(
+        func=calf_vertical_contact_forces,
+        params={"sensor_cfg": SceneEntityCfg(
+            "contact_forces", body_names=["FR_foot", "FL_foot", "RR_foot", "RL_foot"], preserve_order=True,
+        )},
+        scale=0.01,
+    )
+    if cfg.scene.terrain.terrain_type == "generator":
+        critic.height_scan = ObservationsCfg.CriticCfg().height_scan
+
+
+def tires_configure_task_reward_values(self):
+    # 提前终止惩罚
+    self.rewards.is_terminated.weight = -2.0
+    # 机身竖直速度惩罚
+    self.rewards.lin_vel_z_l2.weight = -10.0
+    # 机身横滚和俯仰角速度惩罚
+    self.rewards.ang_vel_xy_l2.weight = -6.0
+    # 机身倾斜惩罚
+    self.rewards.flat_orientation_l2.weight = -2.0
+    # 机身高度误差惩罚
+    self.rewards.base_height_l2.weight = -30.0
+    self.rewards.base_height_l2.params['target_height'] = 0.33
+    self.rewards.base_height_l2.params['asset_cfg'].body_names = [self.base_link_name]
+    # 机身线加速度惩罚
+    self.rewards.body_lin_acc_l2.weight = -0.0002
+    self.rewards.body_lin_acc_l2.params['asset_cfg'].body_names = [self.base_link_name]
+    # 关节力矩惩罚
+    self.rewards.joint_torques_l2.weight = -0.5e-6
+     # 关节速度惩罚
+    self.rewards.joint_vel_l2.weight = 0
+     # 关节加速度惩罚
+    self.rewards.joint_acc_l2.weight = -1e-7
+     # 关节位置限位惩罚
+    self.rewards.joint_pos_limits.weight = -2.0
+     # 关节力矩限位惩罚
+    self.rewards.applied_torque_limits.weight = -0.001
+    self.rewards.applied_torque_limits.params['asset_cfg'].joint_names = self.joint_names
+     # 关节速度限位惩罚
+    self.rewards.joint_vel_limits.weight = 0
+     # 关节功率惩罚
+    self.rewards.joint_power.weight = -1e-6
+     # 静止命令下的站姿偏差惩罚
+    self.rewards.stand_still.weight = -3.0
+     # 关节位置偏离默认姿态惩罚
+    self.rewards.joint_pos_penalty.weight = -2.0
+    self.rewards.joint_pos_penalty.params['stand_still_scale'] = 2.0
+     # 关节镜像不对称惩罚
+    self.rewards.joint_mirror.weight = -0.3
+    self.rewards.joint_mirror.params['mirror_joints'] = [['FR_(hip|thigh|calf).*', 'RL_(hip|thigh|calf).*'], ['FL_(hip|thigh|calf).*', 'RR_(hip|thigh|calf).*']]
+     # 相邻动作变化惩罚
+    self.rewards.action_rate_l2.weight = -1.5
+    # 动作二阶变化惩罚
+    self.rewards.action_smoothness_2_l2.weight = -0.3
+    # 非足端接触惩罚
+    self.rewards.undesired_contacts.weight = -20.0
+    # 过大足端接触力惩罚
+    self.rewards.contact_forces.weight = -0.00015
+    # 水平线速度跟踪奖励
+    self.rewards.track_lin_vel_xy_exp.weight = 80.0
+    # 偏航角速度跟踪奖励
+    self.rewards.track_ang_vel_z_exp.weight = 70.0
+    # 足端腾空时间奖励
+    self.rewards.feet_air_time.weight = 5.0
+    self.rewards.feet_air_time.params['threshold'] = 0.25
+    # 足端腾空时间不一致惩罚
+    self.rewards.feet_air_time_variance.weight = -6.0
+    # 足端接触奖励
+    self.rewards.feet_contact.weight = 0
+    # 足端绊碰惩罚
+    self.rewards.feet_stumble.weight = 0.0
+    # 足端接触滑动惩罚
+    self.rewards.feet_slide.weight = -5.0
+    # 足端高度误差惩罚
+    self.rewards.feet_height.weight = -15.0
+    self.rewards.feet_height.params['target_height'] = 0.08
+    self.rewards.feet_height.params['asset_cfg'].body_names = [self.foot_link_name]
+    # 足端相对机身高度误差惩罚
+    self.rewards.feet_height_body.weight = -5.0
+    self.rewards.feet_height_body.params['target_height'] = -0.07
+    self.rewards.feet_height_body.params['asset_cfg'].body_names = [self.foot_link_name]
+    # 对角步态协调奖励
+    self.rewards.feet_gait.weight = 20.0
+    # 非对角步态接触惩罚
+    self.rewards.diagonal_trot_contact_pattern.weight = -2.0
+    # 机身直立奖励
+    self.rewards.upward.weight = 20.0
+    # 左右足间距奖励
+    self.rewards.feet_distance_y_exp.weight = 5.0
+    self.rewards.feet_distance_y_exp.params['stance_width'] = 0.15
+    self.rewards.feet_distance_y_exp.params['std'] = 0.15
+    self.rewards.feet_distance_y_exp.params['asset_cfg'].body_names = ['FL_calf', 'FR_calf', 'RL_calf', 'RR_calf']
+
+
+def tires_configure_rewards(env_cfg):
+    tires_configure_dog2_phase_swing_reward(env_cfg)
+    defaults = RewardsCfg()
+    for name in ("is_terminated", "applied_torque_limits", "feet_air_time", "feet_air_time_variance",
+                 "feet_contact_without_cmd", "feet_slide", "feet_height", "feet_height_body",
+                 "feet_gait", "diagonal_trot_contact_pattern"):
+        setattr(env_cfg.rewards, name, getattr(defaults, name))
+    rewards = env_cfg.rewards
+    for name, value in vars(defaults).items():
+        if value is not None and getattr(rewards, name, None) is None:
+            setattr(rewards, name, value)
+    tires_configure_task_reward_values(env_cfg)
+    for name in ("feet_air_time", "feet_air_time_variance", "feet_contact_without_cmd", "feet_slide",
+                 "feet_stumble", "contact_forces", "feet_contact"):
+        getattr(rewards, name).params["sensor_cfg"].body_names = [".*_foot"]
+    rewards.feet_slide.params["asset_cfg"].body_names = [".*_foot"]
+    rewards.undesired_contacts.params["sensor_cfg"].body_names = ["^(?!.*_foot$).*"]
+    rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot"))
+    rewards.feet_gait.params["command_threshold"] = 0.0
+    rewards.diagonal_trot_contact_pattern.params["foot_names"] = ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+    rewards.feet_contact_without_cmd.func = standing_contact
+    # 静止命令下足端接触奖励
+    rewards.feet_contact_without_cmd.weight = 10.0
+    rewards.feet_gait.func = CommandedGaitReward
+    rewards.standing_joint_motion = RewTerm(
+        func=standing_joint_velocity,
+        # 静止命令下关节速度惩罚
+        weight=-0.5,
+        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot", joint_names=env_cfg.joint_names)},
+    )
+    rewards.standing_posture = RewTerm(
+        # 静止命令下姿态偏差惩罚
+        func=standing_posture, weight=-5.0,
+        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot", joint_names=env_cfg.joint_names)},
+    )
+    rewards.standing_base_velocity = RewTerm(
+        # 静止命令下机身速度惩罚
+        func=standing_base_velocity, weight=-2.0,
+        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+    )
 
 
 @configclass
@@ -226,6 +440,7 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_rigid_body_material.params["dynamic_friction_range"] = (0.6, 1.8)
 
         # ------------------------------Rewards 奖励函数------------------------------
+        # 以下保留原始说明；其中旧权重和启用状态以文件前方的任务奖励函数为准。
         # 约定:
         # - 正权重: 鼓励该行为（reward）-> 底层返回正值，策略争取高分
         # - 负权重: 惩罚该行为（penalty）-> 底层返回误差/能耗，策略避免扣分
@@ -234,99 +449,60 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         # General
         # 终止奖励（通常在 episode 提前结束时给固定惩罚/奖励）。
         # 这里设为 0，表示不通过该项直接影响学习，终止影响主要体现在回合截断本身。
-        self.rewards.is_terminated.weight = 0
 
         # Root penalties
         # 惩罚机身 z 方向线速度，抑制“跳跃/颠簸”。
         # 绝对值增大 -> 更追求贴地平稳；过大可能抑制跨越障碍能力。
-        self.rewards.lin_vel_z_l2.weight = -10.0
         # 惩罚机身 x/y 角速度（roll/pitch 旋转速度），降低侧翻和点头抖动。
-        self.rewards.ang_vel_xy_l2.weight = -6.0
         # 惩罚机身姿态偏离水平（roll/pitch 倾斜角误差）。
         # 当前关闭，更多依赖速度追踪与接触项“间接”学稳定姿态。
-        self.rewards.flat_orientation_l2.weight = -2.0
         # 机身高度跟踪惩罚: 鼓励 base 高度接近 target_height。
         # 粗糙地形里若设太大，策略可能过于僵硬，不利于跨坎/踏石。
-        self.rewards.base_height_l2.weight = -100.0
         # 目标机身高度（单位 m）。
-        self.rewards.base_height_l2.params["target_height"] = 0.33
         # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）。
-        self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         # 惩罚机身线加速度（平滑机身受力/运动），当前关闭。
         # 该项常用于减小真实机器冲击与传感器饱和风险。
-        self.rewards.body_lin_acc_l2.weight = -2.0e-4
-        self.rewards.body_lin_acc_l2.params["asset_cfg"].body_names = [self.base_link_name]
 
         # Joint penalties
         # 力矩 L2 惩罚，控制能耗并抑制“暴力驱动”。
         # 通常与 joint_power 配合，一个约束幅值，一个约束功率。
-        self.rewards.joint_torques_l2.weight = -2.5e-5
         # 关节速度 L2 惩罚，抑制关节甩动，当前关闭。
-        self.rewards.joint_vel_l2.weight = 0
         # 关节加速度 L2 惩罚，鼓励动作更平滑、降低冲击。
-        self.rewards.joint_acc_l2.weight = -1.0e-5
         # self.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.2, [".*_hip_joint"])
         # 关节限位惩罚: 接近/触发关节上下限时强惩罚，防止打限位。
-        self.rewards.joint_pos_limits.weight = -2.0
         # 关节速度上限惩罚，当前关闭（可在硬件部署前再打开做保守化）。
-        self.rewards.joint_vel_limits.weight = 0
         # 关节功率惩罚（约束机械功输出），降低发热与电池消耗。
-        self.rewards.joint_power.weight = -4.0e-5
         # 静止命令下站立惩罚项（鼓励“该停就停”）。
         # 权重绝对值越大，零速命令时越倾向快速收敛到稳态。
-        self.rewards.stand_still.weight = -30.0
         # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型。
-        self.rewards.joint_pos_penalty.weight = -4.0
-        self.rewards.joint_pos_penalty.params["stand_still_scale"] = 4.0
         # 镜像对称惩罚: 约束对角腿运动统计相近，减少“偏腿”步态。
-        self.rewards.joint_mirror.weight = -0.2
         # 指定镜像关节对:
         # - FR 对 RL
         # - FL 对 RR
         # 有助于形成更自然的对角步态模式。
-        self.rewards.joint_mirror.params["mirror_joints"] = [
-            ["FR_(hip|thigh|calf).*", "RL_(hip|thigh|calf).*"],
-            ["FL_(hip|thigh|calf).*", "RR_(hip|thigh|calf).*"],
-        ]
 
         # Action penalties
         # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性。
-        self.rewards.action_rate_l2.weight = -2.0
         # 二阶动作差分惩罚，抑制高频来回修正导致的机身前后/上下抖动。
-        self.rewards.action_smoothness_2_l2.weight = -0.6
 
         # Contact sensor
         # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”。
-        self.rewards.undesired_contacts.weight = -100.0
-        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{self.foot_link_name}).*"]
         # 足端接触力惩罚，避免落脚冲击过大。
         # 过大可能导致“轻触地”倾向，影响抓地与推进效率。
-        self.rewards.contact_forces.weight = -1.5e-4
-        self.rewards.contact_forces.params["sensor_cfg"].body_names = [self.foot_link_name]
 
         # Velocity-tracking rewards
         # 线速度追踪主奖励（xy 平面，指数型）。
         # 常为 locomotion 核心驱动项，值越大越优先“跟得上命令”。
-        self.rewards.track_lin_vel_xy_exp.weight = 95.0
         # 偏航角速度追踪奖励（绕 z 转向），支持转向命令执行。
-        self.rewards.track_ang_vel_z_exp.weight = 80.0
 
         # Others
         # 足接触奖励（可用于鼓励稳定支撑），当前关闭。
-        self.rewards.feet_contact.weight = 0
-        self.rewards.feet_contact.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 绊脚/碰撞惩罚，当前关闭（可按地形难度逐步启用）。
-        self.rewards.feet_stumble.weight = 0.0
-        self.rewards.feet_stumble.params["sensor_cfg"].body_names = [self.foot_link_name]
         # 机身“向上”姿态奖励（保持重力反方向对齐），提升整体直立稳定性。
-        self.rewards.upward.weight = 0.0
 
-        self.rewards.feet_distance_y_exp.weight = 2.0
-        self.rewards.feet_distance_y_exp.params["stance_width"] = 0.16
-        self.rewards.feet_distance_y_exp.params["std"] = 0.15
-        self.rewards.feet_distance_y_exp.params["asset_cfg"].body_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
 
-        configure_gait_rewards(self, swing_height=0.10)
+        tires_configure_observations(self)
+        tires_configure_rewards(self)
 
         # 将权重为0的奖励项禁用，减少无效计算与配置噪声
         if self.__class__.__name__ == "ATDogDog2TiresEnvCfg":

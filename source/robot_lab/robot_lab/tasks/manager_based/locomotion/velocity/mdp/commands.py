@@ -121,7 +121,7 @@ class PhaseVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
     gait: TrotClockCfg = TrotClockCfg()
 
 
-class StairsVelocityCommand(PhaseVelocityCommand):
+class StairsVelocityCommand(mdp.UniformVelocityCommand):
     """Command outward from the stair platform and measure actual traversal."""
 
     cfg: StairsVelocityCommandCfg
@@ -206,7 +206,7 @@ class StairsVelocityCommand(PhaseVelocityCommand):
 
 
 @configclass
-class StairsVelocityCommandCfg(PhaseVelocityCommandCfg):
+class StairsVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
     class_type: type = StairsVelocityCommand
     stair_speed_range: tuple[float, float] = (0.25, 0.8)
     lateral_ratio: float = 0.35

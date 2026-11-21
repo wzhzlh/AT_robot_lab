@@ -23,15 +23,19 @@ def terrain_levels_stairs(env: ManagerBasedRLEnv, env_ids: Sequence[int]) -> tor
     command_term = env.command_manager.get_term("base_velocity")
     progress = command_term.metrics["stair_progress"][env_ids]
     height_change = command_term.metrics["stair_height_change"][env_ids]
-    command = env.command_manager.get_command("base_velocity")[env_ids, :2]
     eligible = command_term._had_translation[env_ids] & command_term._start_valid[env_ids]
-    success = eligible & (progress >= command_term.cfg.success_distance) & (
+    failed = env.termination_manager.terminated[env_ids]
+    success = eligible & ~failed & (progress >= command_term.cfg.success_distance) & (
         height_change >= command_term.cfg.min_height_change
     )
-    move_up = success
-    required = torch.linalg.vector_norm(command, dim=1) * env.max_episode_length_s * 0.5
-    move_down = eligible & ~success & (progress < 0.6)
+    if not hasattr(env, "_stairs_success_streak"):
+        env._stairs_success_streak = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    streak = env._stairs_success_streak
+    streak[env_ids] = torch.where(success, streak[env_ids] + 1, 0)
+    move_up = success & (streak[env_ids] >= 2) & (terrain.terrain_levels[env_ids] < terrain.max_terrain_level - 1)
+    move_down = eligible & (failed | (progress < 0.6))
     terrain.update_env_origins(env_ids, move_up, move_down)
+    streak[env_ids] = torch.where(move_up, 0, streak[env_ids])
     return terrain.terrain_levels.float().mean()
 
 

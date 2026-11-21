@@ -297,7 +297,9 @@ class HIMVecEnvWrapper:
             manager = self.unwrapped.observation_manager
             phase_index = manager._group_obs_term_names["policy"].index("phase")
             params = manager._group_obs_term_cfgs["policy"][phase_index].params
-            if "command_name" in params:
+            if "command_name" in params and hasattr(
+                self.unwrapped.command_manager.get_term(params["command_name"]), "gait_clock"
+            ):
                 term = self.unwrapped.command_manager.get_term(params["command_name"])
                 metadata["gait_clock"] = term.gait_clock.metadata()
                 metadata["gait_clock"]["control_dt"] = float(self.unwrapped.step_dt)
