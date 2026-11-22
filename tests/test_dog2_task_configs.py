@@ -12,6 +12,21 @@ TASKS = ("flat", "flat_domain_rand", "rough", "stairs", "sand", "slope", "bar", 
 
 
 class TaskConfigTest(unittest.TestCase):
+    def test_tires_uses_terrain_relative_swing_without_world_height_penalty(self):
+        tree = ast.parse((ROOT / "tires_env_cfg.py").read_text())
+        swing = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "tires_configure_dog2_phase_swing_reward")
+        reward = swing.body[0].value
+        params = next(keyword.value for keyword in reward.keywords if keyword.arg == "params")
+        values = {ast.literal_eval(key): value for key, value in zip(params.keys, params.values)}
+        self.assertEqual(ast.literal_eval(values["terrain_sensor_cfg"].args[0]), "height_scanner_base")
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "tires_configure_task_reward_values")
+        weights = [node.value for node in function.body if isinstance(node, ast.Assign)
+                   and len(node.targets) == 1 and ast.unparse(node.targets[0]) == "self.rewards.feet_height.weight"]
+        self.assertEqual(len(weights), 1)
+        self.assertEqual(ast.literal_eval(weights[0]), 0.0)
+
     def test_stairs_world_direction_is_preserved_after_turning(self):
         path = ROOT / "stairs_env_cfg.py"
         tree = ast.parse(path.read_text())

@@ -22,6 +22,7 @@ from .phase_observations import CSDog1Phase, previous_action, velocity_commands
 from .rewards import (CommandedGaitReward, PhaseSwingClearance, standing_contact,
                       standing_joint_velocity, standing_posture, standing_base_velocity)
 from .rough_env_cfg import ATDogDog2RoughEnvCfg
+from .tires_traversal import TireTraversalReward
 
 
 def tire_array_terrain(
@@ -31,7 +32,7 @@ def tire_array_terrain(
     meshes, origin = mesh_terrains.flat_terrain(difficulty, cfg)
     outer_radius = 0.275
     inner_radius = 0.165
-    tire_width = 0.105
+    tire_width = 0.142
     # Keep the collision mesh light; high segment counts multiply across every tire and terrain tile.
     segments = 12
     angles = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False)
@@ -83,6 +84,7 @@ def tire_array_terrain(
                 )
             )
     rng.shuffle(array_centers)
+    cfg.group_centers = [(x - tile_center_x, y - tile_center_y) for x, y in array_centers]
 
     for array_center_x, array_center_y in array_centers:
         for row in range(2):
@@ -98,9 +100,36 @@ def tire_array_terrain(
 @configclass
 class MeshTireArrayTerrainCfg(MeshPlaneTerrainCfg):
     function = tire_array_terrain
+    group_centers: list = []
 
 
-DOG2_TIRE_ARRAY_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+class TireTerrainGenerator(terrain_gen.TerrainGenerator):
+    def _get_terrain_mesh(self, difficulty, cfg):
+        if self.cfg.use_cache:
+            raise ValueError("Tire traversal metadata requires terrain caching to be disabled")
+        terrain_cfg = cfg.copy()
+        meshes, origin = terrain_cfg.function(difficulty, terrain_cfg)
+        self._tire_group_centers = terrain_cfg.group_centers
+        mesh = trimesh.util.concatenate(meshes)
+        transform = np.eye(4)
+        transform[:2, 3] = -np.asarray(terrain_cfg.size) * 0.5
+        mesh.apply_transform(transform)
+        return mesh, origin + transform[:3, 3]
+
+    def _add_sub_terrain(self, mesh, origin, row, col, sub_terrain_cfg):
+        if not self.cfg.group_centers:
+            self.cfg.group_centers = [[None for _ in range(self.cfg.num_cols)] for _ in range(self.cfg.num_rows)]
+        self.cfg.group_centers[row][col] = self._tire_group_centers
+        super()._add_sub_terrain(mesh, origin, row, col, sub_terrain_cfg)
+
+
+@configclass
+class TireTerrainGeneratorCfg(terrain_gen.TerrainGeneratorCfg):
+    class_type = TireTerrainGenerator
+    group_centers: list = []
+
+
+DOG2_TIRE_ARRAY_TERRAIN_CFG = TireTerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=0.0,
     num_rows=5,
@@ -125,8 +154,8 @@ def tires_csdog1_phase_term():
 def tires_configure_dog2_phase_swing_reward(cfg):
     cfg.rewards.phase_swing_clearance = RewTerm(
         func=PhaseSwingClearance,
-        # 摆动相足端高度误差惩罚
-        weight=-2000.0,
+        # 相对足端下方地形的摆动相高度误差惩罚，减轻固定轨迹对跨越轮胎的限制。
+        weight=-0,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=["FL_calf", "FR_calf", "RL_calf", "RR_calf"], preserve_order=True,
@@ -141,8 +170,9 @@ def tires_configure_dog2_phase_swing_reward(cfg):
             "stance_ratio": 0.55,
             "contact_smoothing": 0.07,
             "foot_radius": 0.02,
-            "swing_height": 0.175,
-            "turn_height_bonus": 0.02,
+            "swing_height": 0.185,
+            "turn_height_bonus": 0.015,
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner_base"),
         },
     )
 
@@ -207,14 +237,14 @@ def tires_configure_task_reward_values(self):
     # 机身倾斜惩罚
     self.rewards.flat_orientation_l2.weight = -2.0
     # 机身高度误差惩罚
-    self.rewards.base_height_l2.weight = -30.0
-    self.rewards.base_height_l2.params['target_height'] = 0.33
+    self.rewards.base_height_l2.weight = -330.0
+    self.rewards.base_height_l2.params['target_height'] = 0.315
     self.rewards.base_height_l2.params['asset_cfg'].body_names = [self.base_link_name]
     # 机身线加速度惩罚
     self.rewards.body_lin_acc_l2.weight = -0.0002
     self.rewards.body_lin_acc_l2.params['asset_cfg'].body_names = [self.base_link_name]
     # 关节力矩惩罚
-    self.rewards.joint_torques_l2.weight = -0.5e-6
+    self.rewards.joint_torques_l2.weight = -0.2e-6
      # 关节速度惩罚
     self.rewards.joint_vel_l2.weight = 0
      # 关节加速度惩罚
@@ -245,12 +275,12 @@ def tires_configure_task_reward_values(self):
     # 过大足端接触力惩罚
     self.rewards.contact_forces.weight = -0.00015
     # 水平线速度跟踪奖励
-    self.rewards.track_lin_vel_xy_exp.weight = 80.0
+    self.rewards.track_lin_vel_xy_exp.weight = 70.0
     # 偏航角速度跟踪奖励
     self.rewards.track_ang_vel_z_exp.weight = 70.0
     # 足端腾空时间奖励
     self.rewards.feet_air_time.weight = 5.0
-    self.rewards.feet_air_time.params['threshold'] = 0.25
+    self.rewards.feet_air_time.params['threshold'] = 0.225
     # 足端腾空时间不一致惩罚
     self.rewards.feet_air_time_variance.weight = -6.0
     # 足端接触奖励
@@ -260,12 +290,12 @@ def tires_configure_task_reward_values(self):
     # 足端接触滑动惩罚
     self.rewards.feet_slide.weight = -5.0
     # 足端高度误差惩罚
-    self.rewards.feet_height.weight = -15.0
+    self.rewards.feet_height.weight = 0.0
     self.rewards.feet_height.params['target_height'] = 0.08
     self.rewards.feet_height.params['asset_cfg'].body_names = [self.foot_link_name]
     # 足端相对机身高度误差惩罚
-    self.rewards.feet_height_body.weight = -5.0
-    self.rewards.feet_height_body.params['target_height'] = -0.07
+    self.rewards.feet_height_body.weight = -200.0
+    self.rewards.feet_height_body.params['target_height'] = -0.15
     self.rewards.feet_height_body.params['asset_cfg'].body_names = [self.foot_link_name]
     # 对角步态协调奖励
     self.rewards.feet_gait.weight = 20.0
@@ -274,14 +304,18 @@ def tires_configure_task_reward_values(self):
     # 机身直立奖励
     self.rewards.upward.weight = 20.0
     # 左右足间距奖励
-    self.rewards.feet_distance_y_exp.weight = 5.0
-    self.rewards.feet_distance_y_exp.params['stance_width'] = 0.15
-    self.rewards.feet_distance_y_exp.params['std'] = 0.15
+    self.rewards.feet_distance_y_exp.weight = 50.0
+    self.rewards.feet_distance_y_exp.params['stance_width'] = 0.20
+    self.rewards.feet_distance_y_exp.params['std'] = 0.18
     self.rewards.feet_distance_y_exp.params['asset_cfg'].body_names = ['FL_calf', 'FR_calf', 'RL_calf', 'RR_calf']
 
 
 def tires_configure_rewards(env_cfg):
     tires_configure_dog2_phase_swing_reward(env_cfg)
+    env_cfg.rewards.tire_traversal = RewTerm(
+        func=TireTraversalReward, weight=30.0,
+        params={"command_name": "base_velocity", "half_extent": 0.55, "min_speed": 0.2},
+    )
     defaults = RewardsCfg()
     for name in ("is_terminated", "applied_torque_limits", "feet_air_time", "feet_air_time_variance",
                  "feet_contact_without_cmd", "feet_slide", "feet_height", "feet_height_body",
@@ -516,6 +550,8 @@ class ATDogDog2TiresEnvCfg(LocomotionVelocityRoughEnvCfg):
         # self.curriculum.command_levels.params["range_multiplier"] = (0.2, 1.0)
         # 关闭命令课程，直接使用固定命令范围
         self.curriculum.command_levels = None
+        # 轮胎尺寸不随等级变化，关闭无实际难度递进的地形课程。
+        self.curriculum.terrain_levels = None
 
         # ------------------------------Commands 命令范围------------------------------
         # 如需限制速度指令范围，可取消下方注释并按需调整
