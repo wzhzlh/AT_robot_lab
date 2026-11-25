@@ -173,6 +173,20 @@ def wheel_vel_penalty(
     return reward
 
 
+def wheel_vel_zero_cmd_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    command_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Penalize wheel speed only when the linear velocity command is (near) zero."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)[:, :2]
+    wheel_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    error = torch.mean(torch.square(wheel_vel), dim=1)
+    return error * (torch.linalg.norm(command, dim=1) <= command_threshold)
+
+
 class GaitReward(ManagerTermBase):
     """Gait enforcing reward term for quadrupeds.
 

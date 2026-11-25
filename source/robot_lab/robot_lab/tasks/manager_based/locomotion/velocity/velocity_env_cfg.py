@@ -493,6 +493,16 @@ class RewardsCfg:
         },
     )
 
+    wheel_vel_zero_cmd_l2 = RewTerm(
+        func=mdp.wheel_vel_zero_cmd_l2,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=""),
+            "command_name": "base_velocity",
+            "command_threshold": 0.1,
+        },
+    )
+
     joint_mirror = RewTerm(
         func=mdp.joint_mirror,
         weight=0.0,

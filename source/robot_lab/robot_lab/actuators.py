@@ -1,7 +1,7 @@
 """Delayed PD with fixed-shape buffer operations, preserving per-joint delays."""
 import torch
-from isaaclab.actuators import DelayedPDActuator
-from isaaclab.utils import DelayBuffer
+from isaaclab.actuators import DelayedPDActuator, DelayedPDActuatorCfg, ImplicitActuator, ImplicitActuatorCfg
+from isaaclab.utils import DelayBuffer, configclass
 
 
 class StreamDelayBuffer(DelayBuffer):
@@ -37,3 +37,59 @@ class StreamDelayedPDActuator(DelayedPDActuator):
         self.positions_delay_buffer = StreamDelayBuffer(cfg.max_delay, self._num_envs, self._device)
         self.velocities_delay_buffer = StreamDelayBuffer(cfg.max_delay, self._num_envs, self._device)
         self.efforts_delay_buffer = StreamDelayBuffer(cfg.max_delay, self._num_envs, self._device)
+
+
+def directional_friction_torque(velocity, a_positive, b_positive, a_negative, b_negative):
+    """Resisting joint torque in Nm; velocity in rad/s, zero torque at rest.
+
+    The measured moving-friction fit is |tau| = a * |velocity| + b.
+    Direction refers to the simulated joint coordinate, not robot travel direction.
+    No static/breakaway friction was identified by this fit.
+    """
+    slope = torch.where(velocity >= 0.0, a_positive, a_negative)
+    intercept = torch.where(velocity >= 0.0, b_positive, b_negative)
+    return -torch.sign(velocity) * (slope * velocity.abs() + intercept)
+
+
+def _measured_friction(cfg, velocity):
+    return directional_friction_torque(
+        velocity, cfg.friction_a_positive, cfg.friction_b_positive,
+        cfg.friction_a_negative, cfg.friction_b_negative,
+    )
+
+
+class FrictionDelayedPDActuator(StreamDelayedPDActuator):
+    """Delayed leg controller plus measured passive friction after motor saturation."""
+
+    def compute(self, control_action, joint_pos, joint_vel):
+        action = super().compute(control_action, joint_pos, joint_vel)
+        # Keep motor effort diagnostics separate from the passive resistance.
+        action.joint_efforts = action.joint_efforts + _measured_friction(self.cfg, joint_vel)
+        return action
+
+
+class FrictionImplicitActuator(ImplicitActuator):
+    """Keep the PhysX wheel velocity drive; add passive friction as external effort."""
+
+    def compute(self, control_action, joint_pos, joint_vel):
+        # Implicit PD remains in PhysX. Only passive friction is added here.
+        control_action.joint_efforts = control_action.joint_efforts + _measured_friction(self.cfg, joint_vel)
+        return super().compute(control_action, joint_pos, joint_vel)
+
+
+@configclass
+class FrictionDelayedPDActuatorCfg(DelayedPDActuatorCfg):
+    class_type = FrictionDelayedPDActuator
+    friction_a_positive: float = 0.0107065786
+    friction_b_positive: float = 0.231393197
+    friction_a_negative: float = 0.0122314048
+    friction_b_negative: float = 0.21220256
+
+
+@configclass
+class FrictionImplicitActuatorCfg(ImplicitActuatorCfg):
+    class_type = FrictionImplicitActuator
+    friction_a_positive: float = 0.0107065786
+    friction_b_positive: float = 0.231393197
+    friction_a_negative: float = 0.0122314048
+    friction_b_negative: float = 0.21220256

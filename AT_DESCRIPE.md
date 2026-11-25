@@ -387,6 +387,231 @@ HIM 策略的关键结构（`him_actor_critic.py` / `him_estimator.py`）：
 
 `policy_metadata.json` 记录 `critic_obs_dim=50`、`one_step_obs_dim=47`、`history_length=6`、`history_order=oldest_to_latest`、`history_indices_latest_to_oldest=[5,4,3,2,1,0]`、`actor_current_frame=last`、`estimator_vel_slice=[0,3]`、`estimator_target_slices`、各 policy/critic term 的切片与缩放、以及步态时钟 `gait_clock`；`gait_clock.py`、`at_robot_lab_history.yaml` 供部署端重建相位。导出时 `enable_corruption=False`，训练期的观测噪声不进入部署策略。
 
+## DogW1 轮足机器人：训练、网络与导出（2026-11-24）
+
+DogW1 是在 Dog2 基础上增加四个驱动轮的轮足机器人。资产定义为 `source/robot_lab/robot_lab/assets/atdog.py` 中的 `AT_DOG_W1_CFG`；URDF 为 `source/robot_lab/data/Robots/atdog/dog_w1/urdf/dog_w1.urdf`。机身名称为 `base`。腿部初始角度与 Dog2 一致：hip=0、左 thigh=0.8、右 thigh=−0.8、calf=0；四轮初始角度及全部关节初始速度均为 0，参考 ATDog 轮子配置。初始机身高度为 0.35 m。
+
+独立任务目录为 `source/robot_lab/robot_lab/tasks/manager_based/locomotion/velocity/config/wheeled/dog_w1/`。五个环境分别直接基于通用 `LocomotionVelocityRoughEnvCfg`，不继承 ATDog、Dog2 或其他 DogW1 地形任务；各自文件完整定义动作、观测、奖励、地形和课程设置。`agents/` 内的 PPO、HIM、CUSRL 配置也分别定义每个任务，不继承其他机器人的训练配置。相位实现位于本目录的 `phase_observations.py`，相位步态目标位于 `rewards.py`，轮角度屏蔽位于 `observations.py`。
+
+### 1. 注册任务与训练入口
+
+| 地形 | 完整任务 ID | 环境文件 | HIM 实验目录名 | 默认迭代数（HIM / PPO / CUSRL） |
+| --- | --- | --- | --- | --- |
+| 平地 | `RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0` | `flat_env_cfg.py` | `atdog_dog_w1_flat_him` | 5000 / 5000 / 5000 |
+| 粗糙地形 | `RobotLab-Isaac-Velocity-Rough-ATDog-DogW1-v0` | `rough_env_cfg.py` | `atdog_dog_w1_rough_him` | 20000 / 20000 / 20000 |
+| 坡地 | `RobotLab-Isaac-Velocity-Slope-ATDog-DogW1-v0` | `slope_env_cfg.py` | `atdog_dog_w1_slope_him` | 20000 / 20000 / 20000 |
+| 沙地入口 | `RobotLab-Isaac-Velocity-Sand-ATDog-DogW1-v0` | `sand_env_cfg.py` | `atdog_dog_w1_sand_him` | 20000 / 20000 / 20000 |
+| 楼梯 | `RobotLab-Isaac-Velocity-Stairs-ATDog-DogW1-v0` | `stairs_env_cfg.py` | `atdog_dog_w1_stairs_him` | 20000 / 20000 / 20000 |
+
+`Sand` 沿用原 ATDog 的任务名称，当前实际地形为重复长条箱体障碍，不是可变形沙土：16 个箱体，高 0.30 m，平面尺寸 0.03×1.6 m，起终难度参数一致。`Slope` 坡度范围为 0～0.3（坡度比）；`Stairs` 为正向/倒向金字塔楼梯，台阶高 0.09～0.11 m、宽 0.30 m。`Flat` 关闭地形课程；其余保留地形等级课程，各任务关闭指令等级课程。任务定义和参数应直接在对应地形文件修改。
+
+每个任务都注册以下三个训练入口：
+
+| 入口 | 文件 | 类名格式 |
+| --- | --- | --- |
+| `rsl_rl_him_cfg_entry_point` | `agents/rsl_rl_him_cfg.py` | `ATDogDogW1{地形}HIMRunnerCfg` |
+| `rsl_rl_cfg_entry_point` | `agents/rsl_rl_ppo_cfg.py` | `ATDogDogW1{地形}PPORunnerCfg` |
+| `cusrl_cfg_entry_point` | `agents/cusrl_ppo_cfg.py` | `ATDogDogW1{地形}TrainerCfg` |
+
+以下命令沿用本文容器路径；在本机运行时，把 Isaac Lab 启动器路径和仓库路径替换为实际位置。先进入仓库：
+
+```bash
+cd /workspace/isaaclab_extension_template
+```
+
+HIM 平地训练：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --num_envs=4096 --headless
+```
+
+训练其他地形时，将任务 ID 中的 `Flat` 替换成 `Rough`、`Slope`、`Sand` 或 `Stairs`。可使用 `--max_iterations=1000` 覆盖默认迭代数。HIM checkpoint 保存在 `logs/rsl_rl/atdog_dog_w1_<地形>_him/<运行目录>/model_<迭代>.pt`。
+
+从同一任务的 checkpoint 恢复训练，下面的运行目录和文件名须替换为实际值：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --resume --load_run=2026-11-24_12-00-00 --checkpoint=model_4900.pt \
+  --num_envs=4096 --headless
+```
+
+从 DogW1 平地权重开始新的楼梯训练（不恢复旧优化器和迭代计数）：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=RobotLab-Isaac-Velocity-Stairs-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --him_init_checkpoint=logs/rsl_rl/atdog_dog_w1_flat_him/2026-11-24_12-00-00/model_4900.pt \
+  --num_envs=4096 --headless
+```
+
+各任务当前使用相同的动作/观测布局；修改相位语义、关节顺序或输入缩放后，需要重新核对 checkpoint 的观测契约。Dog2 的 12 动作、47 维单帧模型不能直接作为 DogW1 的 16 动作、59 维单帧模型加载。
+
+标准 PPO 与 CUSRL 平地训练：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0 \
+  --agent=rsl_rl_cfg_entry_point --num_envs=4096 --headless
+
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/cusrl/train.py \
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0 \
+  --agent=cusrl_cfg_entry_point --num_envs=4096 --headless
+```
+
+### DogW1 16 电机实测正反转摩擦
+
+全部 12 个腿电机和 4 个轮电机采用一阶滑动摩擦模型，`|τf|=a·|ω|+b`，摩擦力矩始终与关节速度方向相反：
+
+| 关节速度方向 | a：黏性系数，Nm/(rad/s) | b：库仑摩擦力矩，Nm |
+| --- | --- | --- |
+| 正转 ω>0 | 0.0107065786 | 0.231393197 |
+| 反转 ω<0 | 0.0122314048 | 0.21220256 |
+
+参数保存在 `robot_lab/actuators.py` 的 `FrictionDelayedPDActuatorCfg` / `FrictionImplicitActuatorCfg`，由 `assets/atdog.py::AT_DOG_W1_CFG` 选择。正反方向按 URDF 关节速度坐标判断，不是机身前进/后退。速度为零时取摩擦力矩为零；该滑动拟合没有定义静摩擦/起动摩擦。
+
+腿部保留 PD stiffness=25、damping=0.5 及 1～2 个物理步延迟，在电机输出限幅后叠加被动摩擦；轮子保留隐式速度驱动 stiffness=0、damping=0.8，通过外加关节力矩施加摩擦。PD damping 是控制器 KD，不能替代实测的 a。DogW1 旧关节 friction 设置归零，避免重复计算，其他 ATDog 型号不变。新参数只对重新创建的环境生效，正在运行的训练不会自动更新。
+
+### 2. 动作与 actor / critic 观测排布
+
+物理步长 0.005 s，控制降采样 4，即控制周期 0.02 s、50 Hz。动作总共 16 维，腿部走位置控制、轮子走速度控制：
+
+| 动作切片 | 关节顺序 | 缩放及控制 |
+| --- | --- | --- |
+| `[0:12]` | FR hip/thigh/calf、FL hip/thigh/calf、RR hip/thigh/calf、RL hip/thigh/calf | 相对初始姿态的位置目标；hip 缩放 0.125，其余 0.25；Dog2 的 12 个独立延迟 PD 电机，stiffness=25、damping=0.5、friction=0.5、delay=1～2 个物理步 |
+| `[12:16]` | FR、FL、RR、RL 的 `foot_joint` | 轮速目标缩放 5.0；参考 ATDog 的隐式速度驱动，stiffness=0、damping=0.8、friction=0、effort_limit_sim=23.5、velocity_limit_sim=30 |
+
+Actor 在 ATDog 57 维观测基础上增加两个相位分量，并按 Dog2 的 phase-first 顺序排列，单帧 59 维：
+
+| 切片 | 观测项 | 维度 | 缩放 / 说明 |
+| --- | --- | --- | --- |
+| `[0:2]` | `phase` | 2 | `[sin(2πφ), cos(2πφ)]`，缩放 1 |
+| `[2:5]` | `base_ang_vel` | 3 | 机身角速度，缩放 0.25 |
+| `[5:8]` | `projected_gravity` | 3 | 重力投影，缩放 1 |
+| `[8:11]` | `velocity_commands` | 3 | vx、vy、yaw 速度命令，缩放 1；沿用 ATDog 命令观测 |
+| `[11:27]` | `joint_pos` | 16 | 按动作顺序排列的相对初始角度；四个轮角度在加噪前置零，保留这四个观测位置 |
+| `[27:43]` | `joint_vel` | 16 | 按动作顺序排列的相对初始速度，缩放 0.05 |
+| `[43:59]` | `actions` | 16 | 上次动作，缩放 1 |
+
+HIM 使用 6 帧，总输入 354 维，从旧到新排列，当前帧为 `[295:354]`。标准 PPO / CUSRL 使用 59 维单帧。Actor 不输入真实线速度或地形扫描。训练 policy 保留观测噪声，play / 导出关闭观测噪声。
+
+Critic 延续 Dog2 的字段排布：真实线速度在最前，phase 在 actions 后，共 62 维，不展开历史：
+
+| 切片 | 观测项 | 维度 | 缩放 |
+| --- | --- | --- | --- |
+| `[0:3]` | `base_lin_vel` | 3 | 2.0；同时作为 HIM 速度监督目标 |
+| `[3:6]` | `base_ang_vel` | 3 | 0.25 |
+| `[6:9]` | `projected_gravity` | 3 | 1 |
+| `[9:12]` | `velocity_commands` | 3 | 1 |
+| `[12:28]` | `joint_pos` | 16 | 1，轮角度屏蔽 |
+| `[28:44]` | `joint_vel` | 16 | 0.05 |
+| `[44:60]` | `actions` | 16 | 1 |
+| `[60:62]` | `phase` | 2 | 1 |
+
+五个任务均使用这套 59 / 62 维观测，不向 critic 添加地形扫描或额外接触力。HIM 入口调用 `align_him_critic_observations()`，复制 policy 同名项的函数、关节选择及缩放；DogW1 设置 `him_clean_critic=True`，随后清除 critic 噪声。轮关节的绝对 articulation ID 会先转换为观测列索引，再将轮角度置零，避免显式关节重排后屏蔽错列。
+
+相位使用 Dog2 的命令门控 sin/cos 约定，在 DogW1 本地独立实现。当前周期 0.5 s；当平移命令模长或 yaw 命令绝对值达到 0.05 时，每个控制步推进一次 `φ=(φ+0.02/0.5)%1`。同一步重复读取不会重复推进；静止命令时将 φ 清零，输出 `[0,1]`；每个环境 reset 时也清零。虽然配置保留 `stop_cycle_time` / `stop_duration` 参数，当前实现没有额外停止过渡，它们不改变相位输出。
+
+### 相位与接触奖励修正（2026-11-24）
+
+DogW1 五类任务均改用本目录 `rewards.py` 的相位步态目标，奖励参数在各自的 `*_configure_rewards()` 中独立设置。Actor、critic、接触奖励和摆动高度奖励共享环境内同一个 `DogW1Phase` 状态，每个控制步只推进一次；局部 reset 清零相同环境的时钟。奖励的周期和命令门限直接复制自该任务的 policy phase 配置，配置不一致时会报错，避免奖励与输入悄然错相。
+
+- 原 `mdp.feet_contact()` 统计本步新触地数量，并在数量“不等于预期”时返回 1；正权重会奖励不符合预期。DogW1 的 `feet_contact` 已替换为 `PhaseContactReward`：根据持续接触时间判断当前支撑状态，按 FL、FR、RL、RR 排列，计算每轮接触状态与该轮相位目标的一致率。取值范围 0～1，保持正权重。不能仅靠支撑数量相同获得满分，支撑轮必须匹配相位指定的对角组。
+- `feet_contact_without_cmd` 改为 `standing_contact`：静止时按持续支撑轮数返回 0～4，保持该任务原来的正权重。仅原地转向也视为运动，不触发静止奖励。两者命令门限统一为平移模长 0.05、yaw 绝对值 0.05。
+- 默认 trot：FL/RR 同相，FR/RL 偏移 0.5 周期；周期 0.5 s，`stance_ratio=0.55`。每轮前 55% 周期目标为支撑，后 45% 为摆动，摆动间隙为 `0.08*sin(π*swing_progress)` m。0.55 的支撑比例允许切换阶段短暂四轮支撑。
+- 新增 `phase_swing_clearance`，权重 −160：只对摆动轮的实际离地间隙与相位目标的均方误差扣分。轮心高度扣除轮半径 0.08 m 后计算间隙；平地使用环境原点地面高度，其他四类任务在各轮下方射线查询局部地形高度，无效射线屏蔽。`swing_height` 和 `foot_radius`（轮半径）都可在各任务文件单独调整。
+- 关闭原 `feet_gait`、`feet_air_time`、`feet_air_time_variance`、`feet_height`、`feet_height_body`，由上述相位目标负责接触/抬轮协调，避免 0.35 s 腾空阈值及固定足高与 0.5 s 相位目标冲突。其余用户配置的奖励权重保留。
+
+相位步态配置格式与 Dog2 对齐：各地形独立定义 `<地形>_configure_dog_w1_phase_swing_reward(cfg)`，用 `RewTerm(func=PhaseSwingClearance, weight=..., params={...})` 显式列出 `phase_offset=0.5`、`stance_ratio=0.55`、`contact_smoothing=0.07`、`foot_radius=0.08`、`swing_height=0.08` 和 `turn_height_bonus=0.02`。周期、停止参数和门限从该任务的 policy phase 读取。`<地形>_configure_rewards()` 先调用相位配置，再调用独立权重配置，并把偏移、占空比、平滑参数同步到接触奖励；不继承或导入 Dog2 配置。接触切换使用 Dog2 同形式的 sigmoid 平滑窗口，接触奖励为 `1-mean((actual_contact-desired_contact)^2)`；摆动高度误差按 `1-desired_contact` 加权。原地转向（yaw 绝对值大于 0.2，平移小于启动门限）时在摆动最大高度上增加 0.02 m。轮半径使用与 Dog2 相同的字段名 `foot_radius`，保持 DogW1 自己的 0.08 m 数值。
+
+本次修正在 DogW1 本地实现，其他机器人的旧 `mdp.feet_contact` 配置保持原行为。Actor 59 维单帧、HIM 354 维历史、critic 62 维和 estimator teacher 57 维不变。URDF 与奖励语义已经变化，建议开新训练目录验证，不把旧 run 的总奖励与新 run 直接比较。
+
+无仿真数值验证：`python3 -m unittest discover -s tests -p 'test_dog_w1*.py' -v`。测试覆盖持续接触、错误对角组、相位半周期切换、共享时钟、局部 reset、静止/转向、轮半径与局部地形间隙、无效射线及五类任务的配置接线。未安装 PyTorch 时测试使用 NumPy 适配器计算；完整 Isaac Lab 检查仍使用 `tests/check_dog_w1_sim.py`。
+
+### Flat 5000 次训练复盘后的参数修订（2026-11-24）
+
+本小节为 DogW1 Flat 当前配置，覆盖前文相应旧参数；其他地形不变。完整5000次日志分析、窗口对比、修改表和曲线见 [训练复盘](outputs/dog_w1_5000_review/review.md)。
+
+- Flat 相位接触启用 `centered=True`，使用 `mean((2*actual_contact-1)*(2*desired_contact-1))`，范围−1～1，权重+15；其他地形默认保持原0～1打分。四轮持续着地不再稳定获得约半额奖励。新增独立横向速度平方误差项−20，vx/vy命令范围仍为±1 m/s。
+- Flat 高度权重改为−500，目标保持0.36 m；姿态角速度−3，轮力矩−0.1，轮速L2−0.005，关节位置偏差−1。关闭朝上正奖励、轮速绝对值方差及raw关节镜像项，保留flat_orientation惩罚。phase_swing_clearance权重−1500，轮半径0.08 m、swing_height=0.05 m、turn_height_bonus=0.03 m；周期和观测维度不变。
+- 初始roll/pitch范围±0.15 rad，COM三轴±0.01 m，PD增益乘0.9～1.1，reset外力/力矩±2，关闭间隔推搡。启用机身base触地终止和倾角大于1 rad终止。1000步回合不再是必然结果，应结合失败率与固定命令误差判断。
+- 仅 Flat HIM runner 改为 `init_noise_std=0.6`、`entropy_coef=0.003`，其余网络尺寸、学习率、rollout和迭代数保持。建议用 `--run_name=phase_lateral_fix` 开新训练目录，从头验证；新旧总reward不适合直接比较。
+
+已通过21项配置/数值检查，真实仿真与新训练效果尚未验证。配置修改不是已证实的性能提升，下一轮需逐轮比较期望/实际接触和间隙，并观察横向控制是否形成。
+
+### 3. 各任务的网络与训练参数
+
+| 任务 | HIM actor 输入 → 输出 | 标准 PPO / CUSRL actor 输入 → 输出 | critic 输入 → 输出 | actor / critic 隐藏层 |
+| --- | --- | --- | --- | --- |
+| Flat | 354 维历史，经估计器组合为 78 → 16 | 59 → 16 | 62 → 1 | 各自 `[512,256,128]` |
+| Rough | 354 维历史，经估计器组合为 78 → 16 | 59 → 16 | 62 → 1 | 各自 `[512,256,128]` |
+| Slope | 354 维历史，经估计器组合为 78 → 16 | 59 → 16 | 62 → 1 | 各自 `[512,256,128]` |
+| Sand | 354 维历史，经估计器组合为 78 → 16 | 59 → 16 | 62 → 1 | 各自 `[512,256,128]` |
+| Stairs | 354 维历史，经估计器组合为 78 → 16 | 59 → 16 | 62 → 1 | 各自 `[512,256,128]` |
+
+所有网络使用 ELU。RSL-RL PPO / HIM 的输出为 16 维高斯均值，16 个可学习标准差初值为 1.0；actor / critic 均关闭运行均值方差归一化，使用观测项的固定缩放。CUSRL 使用 `Mlp.Factory`、`NormalDist.Factory`，actor / critic backbone 的 `ends_with_activation=True`，优化器为 AdamW。
+
+HIM 的估计器与网络尺寸：
+
+| 模块 | 输入 → 隐藏层 → 输出 | 用途 |
+| --- | --- | --- |
+| Student encoder | 354 → 128 → 64 → 19 | 历史编码：3 维估计线速度 + 16 维 latent |
+| Teacher target 网络 | 57 → 128 → 64 → 16 | 编码下一步 critic 特征，生成对比学习目标 |
+| Actor | 78 → 512 → 256 → 128 → 16 | 当前帧 59 + 估计速度 3 + latent 16 |
+| Critic | 62 → 512 → 256 → 128 → 1 | 价值估计 |
+
+Teacher 选项与 Dog2 一致：依次读取 `base_ang_vel`、`projected_gravity`、`joint_pos`、`joint_vel`、`actions`、`base_lin_vel`，共 `3+3+16+16+16+3=57` 维，不使用 phase 和命令作为 teacher target。对应 critic 切片为 `[3:6]、[6:9]、[12:28]、[28:44]、[44:60]、[0:3]`；速度回归单独读取 `[0:3]`。这些切片由 HIM wrapper / runner 根据实际字段布局推导，不在任务代码中写死。估计器 lr=1e-3、max_grad_norm=10、prototype 数=32、temperature=3.0；速度损失系数=1.0，swap 损失系数=0.1。
+
+五个任务的 RSL-RL PPO / HIM 均为每次 rollout 24 步，保存间隔 100，学习率 1e-3，adaptive schedule，entropy_coef=0.01，5 epochs、4 minibatches，gamma=0.99、lambda=0.95、clip=0.2、desired_kl=0.01、max_grad_norm=1.0。Flat 默认 5000 次迭代，其余 20000。CUSRL 每次更新 24 步、保存间隔 100，lr=1e-3、entropy 权重 0.008，5 epochs、4 minibatches，其余详见对应 `TrainerCfg`。
+
+### 4. 评估与导出教程
+
+将 `--checkpoint` 路径替换为实际文件。以下以 HIM 平地模型为例，只导出并退出：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task=RobotLab-Isaac-Velocity-Flat-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --checkpoint=/workspace/isaaclab_extension_template/logs/rsl_rl/atdog_dog_w1_flat_him/2026-11-24_12-00-00/model_4900.pt \
+  --num_envs=1 --headless --export_only
+```
+
+需要观察仿真时，去掉 `--headless --export_only`，可把 `--num_envs` 改为 16。其他地形同时替换任务 ID 和 checkpoint 路径。标准 PPO 使用相同 play 脚本，但将 `--agent` 改成 `rsl_rl_cfg_entry_point`，并选择对应 PPO checkpoint。
+
+HIM 的导出文件位于 checkpoint 同级的 `exported/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `policy.pt` | TorchScript，融合 estimator encoder 与 actor |
+| `policy.onnx` | ONNX opset 17，输入 `obs_history` 为 float32 `[1,354]`，输出 `actions` 为 `[1,16]` |
+| `policy_metadata.json` | 59 维单帧、6 帧历史、62 维 critic、16 动作、各项布局/缩放、teacher 切片、观测契约、周期等 |
+| `at_robot_lab_history.yaml` | 部署侧历史配置片段：`num_observations=59`、`expected_policy_input_dim=354`、`observations_history=[5,4,3,2,1,0]` |
+
+部署侧按从旧到新顺序构造六帧，每帧严格遵循上面的 59 维布局，当前帧放最后；模型内部自行估计 3 维速度和 16 维 latent，部署输入不包含 critic 或真实线速度。模型输出仍是动作，需要按上面的 12 个位置目标和 4 个轮速目标进行缩放、偏置和关节映射。标准 PPO 导出输入为 59 维单帧、输出为 16 维，不包含 HIM 估计器与历史。
+
+DogW1 当前使用本地 `DogW1Phase`，导出信息含 `gait_cycle_time=0.5`；它没有命令模块的 `gait_clock`，因此当前不会额外导出 Dog2 的 `gait_clock.py`。部署端应按本节门控、更新和 reset 规则重建相位；仅配置一个不受命令门控的正弦周期不能复现训练输入。完整参数可核对 `policy_metadata.json` 的 `observation_contract` 与本地 `phase_observations.py`。
+
+### 5. 配置检查与仿真检查
+
+无需 Isaac Sim 的配置检查覆盖 URDF 关节/电机匹配、初始化一致性、mesh 路径、注册入口、独立配置、观测顺序、teacher 切片和轮角度屏蔽：
+
+```bash
+python3 -m unittest discover -s tests -p test_dog_w1_configs.py -v
+```
+
+在已安装 Isaac Lab / Isaac Sim 的环境中运行以下检查，加载五套任务配置，再用四个平地环境验证 354 / 59 / 62 / 16 维接线、估计器更新与 JIT 导出一致性：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p tests/check_dog_w1_sim.py --headless
+```
+
+本次编辑环境已通过配置检查；该环境未安装 Isaac Lab / PyTorch，仿真、实际训练和模型导出检查尚未执行。
+
 ## 开始训练
 
 ```bash

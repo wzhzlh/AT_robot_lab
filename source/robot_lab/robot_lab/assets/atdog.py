@@ -5,6 +5,7 @@ from isaaclab.actuators import DCMotorCfg, DelayedPDActuatorCfg, ImplicitActuato
 from isaaclab.assets.articulation import ArticulationCfg
 
 from robot_lab.assets import ISAACLAB_ASSETS_DATA_DIR
+from robot_lab.actuators import FrictionDelayedPDActuatorCfg, FrictionImplicitActuatorCfg
 
 ##
 # Configuration
@@ -182,6 +183,76 @@ AT_DOG_CFG = ArticulationCfg(
     },
 )
 """Configuration of atdog dog using wheel-aware leg and wheel actuators."""
+
+# dog_w1: dog2 leg initialization and motors, with ATDog wheel initialization and drive.
+AT_DOG_W1_CFG = ArticulationCfg(
+    spawn=sim_utils.UrdfFileCfg(
+        fix_base=False,
+        merge_fixed_joints=True,
+        replace_cylinders_with_capsules=False,
+        asset_path=f"{ISAACLAB_ASSETS_DATA_DIR}/Robots/atdog/dog_w1/urdf/dog_w1.urdf",
+        activate_contact_sensors=True,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False, solver_position_iteration_count=4, solver_velocity_iteration_count=0
+        ),
+        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.35),
+        joint_pos={
+            ".*_hip_joint": 0.0,
+            ".*L_thigh_joint": 0.8,
+            ".*R_thigh_joint": -0.8,
+            ".*_calf_joint": 0.0,
+            ".*_foot_joint": 0.0,
+        },
+        joint_vel={".*": 0.0},
+    ),
+    soft_joint_pos_limit_factor=0.9,
+    # 16 motors: measured |tau_f| = a*|joint_vel| + b, opposite to rotation.
+    # Positive: a=0.0107065786, b=0.231393197; negative: a=0.0122314048, b=0.21220256.
+    # Parameters are defined on Friction*ActuatorCfg; damping remains controller KD.
+    # PhysX joint friction is zero to avoid double-counting the measured resistance.
+    actuators={
+        # 左前腿 Front-Left
+        "FL_hip": FrictionDelayedPDActuatorCfg(joint_names_expr=["FL_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "FL_thigh": FrictionDelayedPDActuatorCfg(joint_names_expr=["FL_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "FL_calf": FrictionDelayedPDActuatorCfg(joint_names_expr=["FL_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        # 右前腿 Front-Right
+        "FR_hip": FrictionDelayedPDActuatorCfg(joint_names_expr=["FR_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "FR_thigh": FrictionDelayedPDActuatorCfg(joint_names_expr=["FR_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "FR_calf": FrictionDelayedPDActuatorCfg(joint_names_expr=["FR_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        # 左后腿 Rear-Left
+        "RL_hip": FrictionDelayedPDActuatorCfg(joint_names_expr=["RL_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "RL_thigh": FrictionDelayedPDActuatorCfg(joint_names_expr=["RL_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "RL_calf": FrictionDelayedPDActuatorCfg(joint_names_expr=["RL_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        # 右后腿 Rear-Right
+        "RR_hip": FrictionDelayedPDActuatorCfg(joint_names_expr=["RR_hip_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "RR_thigh": FrictionDelayedPDActuatorCfg(joint_names_expr=["RR_thigh_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "RR_calf": FrictionDelayedPDActuatorCfg(joint_names_expr=["RR_calf_joint"], effort_limit=23.5, velocity_limit=30.0, stiffness=25.0, damping=0.5, friction=0.0, min_delay=1, max_delay=2),
+        "wheels": FrictionImplicitActuatorCfg(
+            joint_names_expr=[".*_foot_joint"],
+            effort_limit_sim=23.5,
+            velocity_limit_sim=30.0,
+            stiffness=0.0,
+            damping=0.8,
+            friction=0.0,
+        ),
+    },
+)
+"""Independent dog_w1 configuration with twelve leg motors and four wheel motors."""
+
 
 AT_DOG3_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
