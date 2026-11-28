@@ -93,7 +93,8 @@ class PhaseSwingClearance(ManagerTermBase):
 
     def __call__(self, env, asset_cfg, command_name, cycle_time, stop_cycle_time, stop_duration,
                  translation_threshold, yaw_threshold, stance_ratio, swing_height, foot_radius,
-                 phase_offset=0.5, contact_smoothing=0.07, turn_height_bonus=0.0, terrain_sensor_cfg=None):
+                 phase_offset=0.5, contact_smoothing=0.07, turn_height_bonus=0.0, terrain_sensor_cfg=None,
+                 max_ground_clearance=None):
         self.clock(env, command_name, cycle_time, stop_cycle_time, stop_duration,
                    translation_threshold, yaw_threshold)
         command = env.command_manager.get_command(command_name)
@@ -118,6 +119,10 @@ class PhaseSwingClearance(ManagerTermBase):
                                                max_dist=3.0, return_normal=True)
             valid = torch.isfinite(hits).all(dim=-1) & torch.isfinite(normals).all(dim=-1) & (normals[..., 2].abs() > 0.5)
             terrain_height = torch.where(valid, hits[..., 2], terrain_height)
+        if max_ground_clearance is not None:
+            # Tires: do not ask for another full swing height above the tire top.
+            ceiling = env.scene.env_origins[:, 2:3] + max_ground_clearance
+            target = torch.minimum(terrain_height + target, ceiling) - terrain_height
         clearance = positions[..., 2] - terrain_height - foot_radius
         swing = (1.0 - stance.float()) * valid
         error = ((clearance - target).square() * swing).sum(dim=1) / swing.sum(dim=1).clamp_min(1)
@@ -133,3 +138,84 @@ def lateral_velocity_error(env, command_name, asset_cfg):
     command = env.command_manager.get_command(command_name)
     velocity = env.scene[asset_cfg.name].data.root_lin_vel_b
     return (command[:, 1] - velocity[:, 1]).square()
+
+
+def wheel_contact_velocity(link_position, com_position, com_velocity, angular_velocity, radius):
+    """Velocity of the bottom tread point on a horizontal fixed ground plane.
+
+    PhysX body_lin_vel_w is COM velocity; body_pos_w is link origin (wheel center).
+    Use absolute world velocity including full wheel spin, with no hardcoded
+    left/right wheel signs and no subtraction of chassis velocity.
+    """
+    offset = link_position - com_position
+    offset = offset.clone()
+    offset[..., 2] -= radius
+    return com_velocity + torch.cross(angular_velocity, offset, dim=-1)
+
+
+def wheel_ground_slip(env, sensor_cfg, asset_cfg, wheel_radius):
+    """Flat-ground tangential tread slip, gated by ongoing wheel contact."""
+    data = env.scene[asset_cfg.name].data
+    ids = asset_cfg.body_ids
+    velocity = wheel_contact_velocity(
+        data.body_pos_w[:, ids], data.body_com_pos_w[:, ids],
+        data.body_lin_vel_w[:, ids], data.body_ang_vel_w[:, ids], wheel_radius,
+    )
+    contact = env.scene.sensors[sensor_cfg.name].data.current_contact_time[:, sensor_cfg.body_ids] > 0.0
+    return (torch.linalg.vector_norm(velocity[..., :2], dim=-1) * contact).sum(dim=1)
+
+
+def stationary_wheel_velocity(env, asset_cfg, command_name, translation_threshold=0.05, yaw_threshold=0.05):
+    command = env.command_manager.get_command(command_name)
+    stationary = ~moving_command(command, translation_threshold, yaw_threshold)
+    return env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids].square().mean(dim=1) * stationary
+
+
+def base_height_above_support_l2(
+    env, target_height, asset_cfg, wheel_cfg, wheel_radius=0.0765, contact_sensor_cfg=None,
+    sensor_cfg=None,  # legacy RewTerm param from base_height_l2; intentionally unused
+):
+    """Track base height relative to the supporting wheels, not world Z.
+
+    The tire field has a 0.142 m tall annulus with a 0.33 m hole in the middle;
+    height_scanner_base only shoots 3x3 rays over a 0.1 m patch, so it can easily
+    miss the tire and report ground height while the wheels stand on the tire.
+    Using the lowest contacting wheel bottom as the support plane keeps the
+    target height climbing with the robot.
+    """
+    asset = env.scene[asset_cfg.name]
+    wheel_bottom = asset.data.body_pos_w[:, wheel_cfg.body_ids, 2] - wheel_radius
+    if contact_sensor_cfg is not None:
+        sensor = env.scene.sensors[contact_sensor_cfg.name]
+        contact = sensor.data.current_contact_time[:, contact_sensor_cfg.body_ids] > 0.0
+        wheel_bottom = torch.where(contact, wheel_bottom, torch.full_like(wheel_bottom, float("inf")))
+        grounded = contact.any(dim=1)
+        support_z = torch.where(grounded, wheel_bottom.min(dim=1).values, env.scene.env_origins[:, 2])
+    else:
+        support_z = wheel_bottom.min(dim=1).values
+
+    desired = support_z + target_height
+    reward = torch.square(asset.data.root_pos_w[:, 2] - desired)
+    reward *= torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 0.7) / 0.7
+    return reward
+
+
+
+def standing_joint_velocity(env, command_name, asset_cfg):
+    """Dog2-style standing motion penalty, with wheel joints selected separately."""
+    stationary = ~moving_command(env.command_manager.get_command(command_name))
+    velocity = env.scene[asset_cfg.name].data.joint_vel[:, asset_cfg.joint_ids]
+    return velocity.square().mean(dim=1).clamp(max=25.0) * stationary
+
+
+def standing_posture(env, command_name, asset_cfg):
+    """Quadratic nominal leg posture, rather than a strong global L1 constraint."""
+    data = env.scene[asset_cfg.name].data
+    error = data.joint_pos[:, asset_cfg.joint_ids] - data.default_joint_pos[:, asset_cfg.joint_ids]
+    return error.square().mean(dim=1) * ~moving_command(env.command_manager.get_command(command_name))
+
+
+def standing_base_velocity(env, command_name, asset_cfg):
+    data = env.scene[asset_cfg.name].data
+    speed = data.root_lin_vel_b.square().sum(dim=1) + data.root_ang_vel_b.square().sum(dim=1)
+    return speed * ~moving_command(env.command_manager.get_command(command_name))

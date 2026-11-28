@@ -80,3 +80,16 @@ gym.register(
         "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:ATDogDogW1TiresTrainerCfg",
     },
 )
+
+
+gym.register(
+    id="RobotLab-Isaac-Velocity-Wall-ATDog-DogW1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.wall_env_cfg:ATDogDogW1WallEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ATDogDogW1WallPPORunnerCfg",
+        "rsl_rl_him_cfg_entry_point": f"{agents.__name__}.rsl_rl_him_cfg:ATDogDogW1WallHIMRunnerCfg",
+        "cusrl_cfg_entry_point": f"{agents.__name__}.cusrl_ppo_cfg:ATDogDogW1WallTrainerCfg",
+    },
+)

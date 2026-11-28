@@ -38,6 +38,11 @@ def main():
         names = [name for name, value in vars(cfg.observations.policy).items() if hasattr(value, "func")]
         assert names == expected_names, (terrain, names)
         assert cfg.base_link_name == "base"
+        wrench = cfg.events.randomize_apply_external_force_torque
+        assert wrench.mode == "reset"
+        assert wrench.params["asset_cfg"].body_names == ["base"]
+        assert wrench.params["force_range"] == (-10.0, 10.0)
+        assert wrench.params["torque_range"] == (-10.0, 10.0)
         assert len(cfg.actions.joint_pos.joint_names) == 12
         assert len(cfg.actions.joint_vel.joint_names) == 4
         assert cfg.rewards.feet_contact.func.__name__ == "PhaseContactReward"
@@ -45,11 +50,17 @@ def main():
         assert cfg.rewards.phase_swing_clearance.weight < 0
         assert cfg.rewards.feet_air_time is None
         if terrain == "Flat":
+            assert cfg.actions.joint_vel.class_type.__name__ == "DogW1WheelVelocityAction"
+            assert cfg.commands.base_velocity.class_type.__name__ == "DogW1VelocityCommand"
+            assert cfg.rewards.feet_slide.func.__name__ == "wheel_ground_slip"
+            assert cfg.rewards.wheel_vel_zero_cmd_l2.func.__name__ == "stationary_wheel_velocity"
             assert cfg.rewards.feet_contact.params["centered"]
             assert cfg.rewards.lateral_velocity_error.weight < 0
             assert cfg.terminations.illegal_contact is not None
             assert cfg.terminations.bad_orientation.params["limit_angle"] == 1.0
-            assert cfg.events.randomize_push_robot is None
+            assert cfg.events.randomize_push_robot.params["velocity_range"]["y"] == (-0.2, 0.2)
+            assert cfg.rewards.feet_distance_y_exp.params["asset_cfg"].preserve_order
+            assert cfg.rewards.standing_base_velocity.weight == -2.0
             assert agent.algorithm.entropy_coef == 0.003
         for name, value in cfg.observations.policy.phase.params.items():
             assert cfg.rewards.feet_contact.params[name] == value

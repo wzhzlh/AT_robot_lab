@@ -1,6 +1,7 @@
 # Copyright (c) 2024-2025 Ziqi Fan
 # SPDX-License-Identifier: Apache-2.0
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import ObservationGroupCfg as ObsGroup, ObservationTermCfg as ObsTerm
@@ -20,8 +21,10 @@ from robot_lab.tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 ##
 from robot_lab.assets.atdog import AT_DOG_W1_CFG  # isort: skip
 from .phase_observations import DogW1Phase
-from .observations import joint_pos_rel_without_wheel
-from .rewards import PhaseContactReward, PhaseSwingClearance, standing_contact
+from .observations import dog_w1_joint_pos_scale, dog_w1_joint_vel_scale, joint_pos_rel_without_wheel
+from .rewards import PhaseContactReward, PhaseSwingClearance, standing_contact, lateral_velocity_error, wheel_ground_slip, stationary_wheel_velocity
+from .actions import DogW1WheelVelocityActionCfg
+from .commands import DogW1VelocityCommand
 
 
 DOG_SLOPE_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
@@ -105,136 +108,107 @@ def slope_configure_observations(cfg):
             group_term.params["asset_cfg"].preserve_order = True
 
 
-
 def slope_configure_task_reward_values(cfg):
-    """集中设置 slope 地形的奖励权重与参数。"""
+    """坡地奖励权重：步态目标与 flat 一致，地面高度由扫描器提供。"""
+    rewards = cfg.rewards
 
-    cfg.rewards.lin_vel_z_l2.weight = -7.0
-    # 惩罚机身 x/y 角速度（roll/pitch 旋转速度），降低侧翻和点头抖动
-    cfg.rewards.ang_vel_xy_l2.weight = -0.12
-    # 惩罚机身姿态偏离水平（roll/pitch 倾斜角误差）
-    cfg.rewards.flat_orientation_l2.weight = 0
-    # 机身高度跟踪惩罚（当前关闭）
-    cfg.rewards.base_height_l2.weight = -300
-    cfg.rewards.base_height_l2.params["target_height"] = 0.35
-    # 指定用 base 刚体计算该项（避免多 body 统计带来歧义）
-    cfg.rewards.base_height_l2.params["asset_cfg"].body_names = [cfg.base_link_name]
-    # 惩罚机身线加速度（平滑机身受力/运动），当前关闭
-    cfg.rewards.body_lin_acc_l2.weight = 0
-    cfg.rewards.body_lin_acc_l2.params["asset_cfg"].body_names = [cfg.base_link_name]
+    # --- 终止与机身姿态：先保证不摔倒、不弹跳、不过度倾斜 ---
+    rewards.is_terminated.weight = -2.0  # 提前终止固定罚，避免策略故意摔倒重开
+    rewards.lin_vel_z_l2.weight = -10.0  # 抑制机身 z 向跳动
+    rewards.ang_vel_xy_l2.weight = -3.0  # 抑制 roll/pitch 角速度，减少点头与侧翻
+    rewards.flat_orientation_l2.weight = -30.0  # 机身偏离水平越强，惩罚越大（防止前低后高）
+    rewards.base_height_l2.weight = -500.0  # 强高度跟踪，目标 0.36m
+    rewards.base_height_l2.params["target_height"] = 0.36
+    rewards.base_height_l2.params["asset_cfg"].body_names = [cfg.base_link_name]
+    rewards.body_lin_acc_l2.weight = -0.0002  # 轻微抑制机身线加速度抖动
+    rewards.body_lin_acc_l2.params["asset_cfg"].body_names = [cfg.base_link_name]
 
-    # Joint penalties
-    # 腿部力矩 L2 惩罚，控制能耗并抑制“暴力驱动”
-    cfg.rewards.joint_torques_l2.weight = -2.5e-5
-    cfg.rewards.joint_torques_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 轮部力矩 L2 惩罚（单独项，当前关闭）
-    cfg.rewards.joint_torques_wheel_l2.weight = -0.02
-    cfg.rewards.joint_torques_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # 腿部关节速度 L2 惩罚（当前关闭）
-    cfg.rewards.joint_vel_l2.weight = 0
-    cfg.rewards.joint_vel_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 轮部关节速度 L2 惩罚（当前关闭）
-    cfg.rewards.joint_vel_wheel_l2.weight = -2.5e-1
-    cfg.rewards.joint_vel_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # 腿部关节加速度 L2 惩罚，鼓励动作更平滑
-    cfg.rewards.joint_acc_l2.weight = -2.5e-5
-    cfg.rewards.joint_acc_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 轮部关节加速度 L2 惩罚
-    cfg.rewards.joint_acc_wheel_l2.weight = -2.5e-6
-    cfg.rewards.joint_acc_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # cfg.rewards.create_joint_deviation_l1_rewterm("joint_deviation_hip_l1", -0.2, [".*_hip_joint"])
-    # 腿部关节限位惩罚: 接近/触发关节上下限时强惩罚，防止打限位
-    cfg.rewards.joint_pos_limits.weight = -5.0
-    cfg.rewards.joint_pos_limits.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 轮关节速度上限惩罚，当前关闭
-    cfg.rewards.joint_vel_limits.weight = -4.0
-    cfg.rewards.joint_vel_limits.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # 腿部关节功率惩罚（约束机械功输出），降低发热与电池消耗
-    cfg.rewards.joint_power.weight = -2.5e-5
-    cfg.rewards.joint_power.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 静止命令下站立惩罚项（鼓励“该停就停”）
-    cfg.rewards.stand_still.weight = -2.0
-    cfg.rewards.stand_still.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 关节位置正则惩罚（通常相对默认姿态/安全姿态），抑制异常构型
-    cfg.rewards.joint_pos_penalty.weight = -30.0
-    cfg.rewards.joint_pos_penalty.params["asset_cfg"].joint_names = cfg.leg_joint_names
-    # 轮速惩罚（配合接触与命令状态使用），当前关闭
-    cfg.rewards.wheel_vel_penalty.weight = 0
-    cfg.rewards.wheel_vel_penalty.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    cfg.rewards.wheel_vel_penalty.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # 轮速方差惩罚: 约束四个轮子速度（绝对值）保持一致，提升轮式运动协调性
-    cfg.rewards.wheel_vel_variance.weight = -0.2
-    cfg.rewards.wheel_vel_variance.params["asset_cfg"].joint_names = cfg.wheel_joint_names
-    # 镜像对称惩罚: 约束对角腿对应关节的位置幅值相近，减少“偏腿”步态
-    cfg.rewards.joint_mirror.weight = -2.0
-    cfg.rewards.joint_mirror.params["mirror_joints"] = [
+    # --- 能耗与平滑：腿关节保留摆动幅度，轮关节只做轻约束 ---
+    rewards.joint_torques_l2.weight = -1e-6  # 腿力矩成本，量级极小以免压制摆动
+    rewards.joint_torques_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.joint_torques_wheel_l2.weight = -0.1  # 轮力矩成本，避免空转烧电机
+    rewards.joint_torques_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.joint_vel_l2.weight = 0.0  # 腿速惩罚关闭，摆腿需要快速响应
+    rewards.joint_vel_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.joint_vel_wheel_l2.weight = -0.005  # 轻微轮速惩罚，不阻碍速度跟踪
+    rewards.joint_vel_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.joint_acc_l2.weight = -1.5e-5  # 腿加速度 L2，动作更平滑易部署
+    rewards.joint_acc_l2.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.joint_acc_wheel_l2.weight = -2.5e-6  # 轮加速度 L2，抑制轮速突变
+    rewards.joint_acc_wheel_l2.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.joint_pos_limits.weight = -5.0  # 靠近关节限位时强惩罚
+    rewards.joint_pos_limits.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.joint_vel_limits.weight = -4.0  # 轮速超限惩罚
+    rewards.joint_vel_limits.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.joint_power.weight = -1e-6  # 机械功率成本，控制发热
+    rewards.joint_power.params["asset_cfg"].joint_names = cfg.leg_joint_names
+
+    # --- 站立与姿态正则 ---
+    rewards.stand_still.weight = -10.0  # 零命令时惩罚腿部无谓动作
+    rewards.stand_still.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.joint_pos_penalty.weight = -10.0  # 强约束关节回到默认姿态附近
+    rewards.joint_pos_penalty.params["asset_cfg"].joint_names = cfg.leg_joint_names
+    rewards.wheel_vel_penalty.weight = 0.0  # 通用轮速惩罚关闭，交给零命令专用项
+    rewards.wheel_vel_penalty.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.wheel_vel_penalty.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.wheel_vel_zero_cmd_l2.weight = -20.0  # 零命令时惩罚轮速，配合 parking brake 站稳
+    rewards.wheel_vel_zero_cmd_l2.func = stationary_wheel_velocity
+    rewards.wheel_vel_zero_cmd_l2.params = {
+        "asset_cfg": SceneEntityCfg("robot", joint_names=cfg.wheel_joint_names, preserve_order=True),
+        **{key: cfg.observations.policy.phase.params[key]
+           for key in ("command_name", "translation_threshold", "yaw_threshold")},
+    }
+    rewards.wheel_vel_variance.weight = 0.0  # 不强制四轮同速，转向需要差速
+    rewards.wheel_vel_variance.params["asset_cfg"].joint_names = cfg.wheel_joint_names
+    rewards.joint_mirror.weight = 0.0  # 不强制镜像，允许侧向步态
+    rewards.joint_mirror.params["mirror_joints"] = [
         ["FR_(hip|thigh|calf).*", "RL_(hip|thigh|calf).*"],
         ["FL_(hip|thigh|calf).*", "RR_(hip|thigh|calf).*"],
     ]
 
-    # Action penalties
-    # 动作变化率惩罚，抑制相邻时刻动作突变，提升控制平滑性与可部署性
-    cfg.rewards.action_rate_l2.weight = -0.8
+    # --- 动作平滑与接触安全 ---
+    rewards.action_rate_l2.weight = -1.0  # 抑制相邻动作突变，降低部署抖动
+    rewards.undesired_contacts.weight = -15.0  # 非足端接触强惩罚
+    rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{cfg.foot_link_name}).*"]
+    rewards.contact_forces.weight = -1.5e-5  # 足端落地冲击惩罚
+    rewards.contact_forces.params["sensor_cfg"].body_names = [cfg.foot_link_name]
 
-    # Contact sensor
-    # 非足端 body 接触惩罚（如躯干/大腿触地），鼓励“只让脚接触地面”
-    cfg.rewards.undesired_contacts.weight = -30.0
-    cfg.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{cfg.foot_link_name}).*"]
-    # 足端接触力惩罚，避免落脚冲击过大
-    cfg.rewards.contact_forces.weight = -1.5e-5
-    cfg.rewards.contact_forces.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    # --- 速度跟踪：主任务奖励，权重最高 ---
+    rewards.track_lin_vel_xy_exp.weight = 80.0  # xy 线速度跟踪主奖励
+    rewards.track_ang_vel_z_exp.weight = 75.0  # 偏航角速度跟踪奖励
 
-    # Velocity-tracking rewards
-    # 线速度追踪主奖励（xy 平面，指数型）
-    cfg.rewards.track_lin_vel_xy_exp.weight = 50.0
-    # 偏航角速度追踪奖励（绕 z 转向）
-    cfg.rewards.track_ang_vel_z_exp.weight = 40.0
-
-    # Others
-    # 足端腾空时间奖励: 鼓励形成明确摆动相，避免拖脚
-    cfg.rewards.feet_air_time.weight = 0.0  # Replaced by shared-phase contact/clearance targets.
-    # 只在腾空时间超过阈值时开始计入（单位 s），避免“微小离地”刷分
-    cfg.rewards.feet_air_time.params["threshold"] = 0.35
-    cfg.rewards.feet_air_time.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    # 移动时按相位匹配各轮持续接触状态，满分为 1。
-    cfg.rewards.feet_contact.weight = 5.0
-    cfg.rewards.feet_contact.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    # 无速度命令时保持接触（鼓励原地稳定）
-    cfg.rewards.feet_contact_without_cmd.weight = 0.5
-    cfg.rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    # 绊脚惩罚（当前关闭）
-    cfg.rewards.feet_stumble.weight = 0
-    cfg.rewards.feet_stumble.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    # 滑足惩罚: 脚着地后相对地面滑移越大，惩罚越大
-    cfg.rewards.feet_slide.weight = -5.0
-    cfg.rewards.feet_slide.params["sensor_cfg"].body_names = [cfg.foot_link_name]
-    cfg.rewards.feet_slide.params["asset_cfg"].body_names = [cfg.foot_link_name]
-    # 足端绝对高度目标项
-    cfg.rewards.feet_height.weight = 0.0  # Replaced by shared-phase contact/clearance targets.
-    cfg.rewards.feet_height.params["target_height"] = 0.15
-    cfg.rewards.feet_height.params["asset_cfg"].body_names = [cfg.foot_link_name]
-    # 相对机身的足端高度惩罚（body frame）
-    cfg.rewards.feet_height_body.weight = 0.0  # Replaced by shared-phase contact/clearance targets.
-    cfg.rewards.feet_height_body.params["target_height"] = -0.20
-    cfg.rewards.feet_height_body.params["asset_cfg"].body_names = [cfg.foot_link_name]
-    # 原接触时间同步项关闭，由共享相位指定对角支撑。
-    cfg.rewards.feet_gait.weight = 0.0  # Replaced by shared-phase contact/clearance targets.
-    cfg.rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot"))
-
-    # cfg.rewards.feet_air_time_variance.weight = 0.0  # Replaced by shared-phase contact/clearance targets.
-    # cfg.rewards.feet_air_time_variance.params["sensor_cfg"].body_names = [cfg.foot_link_name]     
-
-    # 机身朝上约束奖励
-    cfg.rewards.upward.weight = 2.0
+    # --- 步态：旧的腾空/足高项关闭，统一由相位目标驱动 ---
+    rewards.feet_air_time.weight = 0.0  # 由相位接触目标取代
+    rewards.feet_air_time.params["threshold"] = 0.35
+    rewards.feet_air_time.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_contact.weight = 15.0  # 相位匹配的支撑/摆动奖励，权重大以稳定步态
+    rewards.feet_contact.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_contact_without_cmd.weight = 4.0  # 零命令时鼓励四轮支撑
+    rewards.feet_contact_without_cmd.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_stumble.weight = 0.0  # 绊脚项关闭
+    rewards.feet_stumble.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_slide.weight = -5.0  # 轮底滑移惩罚，按接触门控
+    rewards.feet_slide.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_slide.params["asset_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_height.weight = -0.0  # 绝对足高项关闭
+    rewards.feet_height.params["target_height"] = 0.07
+    rewards.feet_height.params["asset_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_height_body.weight = -0.0  # 相对机身足高项关闭
+    rewards.feet_height_body.params["target_height"] = -0.29
+    rewards.feet_height_body.params["asset_cfg"].body_names = [cfg.foot_link_name]
+    rewards.feet_gait.weight = 0.0  # 原同步步态项关闭
+    rewards.feet_gait.params["synced_feet_pair_names"] = (("FL_foot", "RR_foot"), ("FR_foot", "RL_foot"))
+    rewards.feet_air_time_variance.weight = 0.0  # 腾空方差项关闭
+    rewards.feet_air_time_variance.params["sensor_cfg"].body_names = [cfg.foot_link_name]
+    rewards.upward.weight = 10.0  # 保持机身朝上
 
 
 def slope_configure_dog_w1_phase_swing_reward(cfg):
-    """与 dog2 相同的相位奖励配置格式；轮心位置扣除实际轮半径。"""
+    """摆动相抬轮目标：轮心位置扣除实测轮半径；地形任务用高度扫描器取地面高度。"""
     phase_params = cfg.observations.policy.phase.params
     cfg.rewards.phase_swing_clearance = RewTerm(
         func=PhaseSwingClearance,
-        # 摆动相轮足高度误差惩罚
-        weight=-160.0,
+        weight=-2000.0,  # 摆动相高度误差惩罚，权重大保证抬轮干净
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True,
@@ -245,22 +219,38 @@ def slope_configure_dog_w1_phase_swing_reward(cfg):
             "stop_duration": phase_params["stop_duration"],
             "translation_threshold": phase_params["translation_threshold"],
             "yaw_threshold": phase_params["yaw_threshold"],
-            "phase_offset": 0.5,
-            "stance_ratio": 0.55,
-            "contact_smoothing": 0.07,
-            "foot_radius": 0.08,
-            "swing_height": 0.08,
-            "turn_height_bonus": 0.02,
-            "terrain_sensor_cfg": SceneEntityCfg("height_scanner_base"),
+            "phase_offset": 0.5,  # FL/RR 与 FR/RL 相差半周期
+            "stance_ratio": 0.55,  # 支撑相占比
+            "contact_smoothing": 0.07,  # 接触判定平滑窗口
+            "foot_radius": 0.0765,  # 实测轮半径
+            "swing_height": 0.10,  # 摆动相目标离地高度
+            "turn_height_bonus": 0.03,  # 原地转向时额外抬轮
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner_base"),  # 地形任务用高度扫描器，平地不用
         },
     )
 
 
 def slope_configure_rewards(cfg):
-    """按 dog2 顺序设置相位目标，再应用本任务奖励参数。"""
+    """组装本任务奖励：相位目标 -> 权重 -> 接触/滑移，再追加任务专属项。"""
     slope_configure_dog_w1_phase_swing_reward(cfg)
     slope_configure_task_reward_values(cfg)
-    # 接触与摆动共享相位、占空比、对角偏移和切换平滑参数。
+
+    cfg.rewards.lateral_velocity_error = RewTerm(
+        func=lateral_velocity_error, weight=-20.0,  # 密集横向误差，避免指数奖励在大误差处梯度消失
+        params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+    )
+    # 平面轮底切向滑移：只有轮子真的接触地面时才计入。
+    cfg.rewards.feet_slide.func = wheel_ground_slip
+    cfg.rewards.feet_slide.params = {
+        "asset_cfg": SceneEntityCfg(
+            "robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True,
+        ),
+        "sensor_cfg": SceneEntityCfg(
+            "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True,
+        ),
+        "wheel_radius": cfg.rewards.phase_swing_clearance.params["foot_radius"],
+    }
+
     swing_params = cfg.rewards.phase_swing_clearance.params
     phase_params = dict(cfg.observations.policy.phase.params)
     cfg.rewards.feet_contact.func = PhaseContactReward
@@ -269,6 +259,7 @@ def slope_configure_rewards(cfg):
         "sensor_cfg": SceneEntityCfg(
             "contact_forces", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"], preserve_order=True,
         ),
+        "centered": True,  # 每个轮子 +1/-1，避免四轮着地只得半分
         "phase_offset": swing_params["phase_offset"],
         "stance_ratio": swing_params["stance_ratio"],
         "contact_smoothing": swing_params["contact_smoothing"],
@@ -283,6 +274,7 @@ def slope_configure_rewards(cfg):
         ),
     }
 
+
 @configclass
 class ATDogDogW1ActionsCfg(ActionsCfg):
     """Action specifications for the MDP."""
@@ -291,7 +283,7 @@ class ATDogDogW1ActionsCfg(ActionsCfg):
         asset_name="robot", joint_names=[""], scale=0.25, use_default_offset=True, clip=None, preserve_order=True
     )
 
-    joint_vel = mdp.JointVelocityActionCfg(
+    joint_vel = DogW1WheelVelocityActionCfg(
         asset_name="robot", joint_names=[""], scale=5.0, use_default_offset=True, clip=None, preserve_order=True
     )
 
@@ -360,10 +352,14 @@ class ATDogDogW1SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         # ------------------------------Observations------------------------------
         slope_configure_observations(self)
 
+        self.commands.base_velocity.class_type = DogW1VelocityCommand
+        for key in ("command_name", "translation_threshold", "yaw_threshold"):
+            setattr(self.actions.joint_vel, key, self.observations.policy.phase.params[key])
+
         # ------------------------------Actions------------------------------
         # 髋关节幅度更小(0.125)，其余腿关节 0.25，轮关节速度缩放 5.0
-        self.actions.joint_pos.scale = {".*_hip_joint": 0.125, "^(?!.*_hip_joint).*": 0.25}
-        self.actions.joint_vel.scale = 5.0
+        self.actions.joint_pos.scale = dog_w1_joint_pos_scale()
+        self.actions.joint_vel.scale = dog_w1_joint_vel_scale()
         self.actions.joint_pos.clip = {".*": (-100.0, 100.0)}
         self.actions.joint_vel.clip = {".*": (-100.0, 100.0)}
         self.actions.joint_pos.joint_names = self.leg_joint_names
@@ -385,8 +381,17 @@ class ATDogDogW1SlopeEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.events.randomize_com_positions.params["asset_cfg"].body_names = [self.base_link_name]
         self.events.randomize_apply_external_force_torque.params["asset_cfg"].body_names = [self.base_link_name]
 
+        # 与 flat 一致的外力/外力矩扰动：reset 时对 base 施加 ±10 N / ±10 N·m 随机 wrench
+        self.events.randomize_apply_external_force_torque.params["force_range"] = (-10.0, 10.0)
+        self.events.randomize_apply_external_force_torque.params["torque_range"] = (-10.0, 10.0)
+        # 与 flat 一致的周期性速度扰动（推搡）：每 15-20 s 把 base 的 xy 速度设为 ±0.2 m/s
+        self.events.randomize_push_robot = EventTerm(
+            func=mdp.push_by_setting_velocity, mode="interval", interval_range_s=(15.0, 20.0),
+            params={"velocity_range": {"x": (-0.2, 0.2), "y": (-0.2, 0.2)}},
+        )
+
         # ------------------------------Rewards------------------------------
-        # 奖励权重集中在 slope_configure_task_reward_values / slope_configure_rewards
+        # 奖励权重在本文件对应的 *_configure_task_reward_values 中逐项标注
         slope_configure_rewards(self)
 
         # If the weight of rewards is 0, set rewards to None

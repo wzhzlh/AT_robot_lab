@@ -211,3 +211,9 @@ class ATDogDogW1TiresTrainerCfg(TrainerCfg):
             cusrl.hook.AdaptiveLRSchedule(desired_kl_divergence=0.01),
         ],
     )
+
+
+@dataclass
+class ATDogDogW1WallTrainerCfg(ATDogDogW1FlatTrainerCfg):
+    experiment_name = "atdog_dog_w1_wall"
+    max_iterations = 10000

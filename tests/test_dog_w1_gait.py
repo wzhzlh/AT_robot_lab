@@ -32,7 +32,7 @@ except ImportError:
             return np.abs(self)
 
         def sum(self, dim=None, **kwargs):
-            return np.asarray(super().sum(axis=dim, **kwargs)).view(Tensor)
+            return np.asarray(super().sum(axis=kwargs.pop("axis", dim), keepdims=kwargs.pop("keepdim", False), **kwargs)).view(Tensor)
 
         def mean(self, dim=None, **kwargs):
             return np.asarray(super().mean(axis=dim, **kwargs)).view(Tensor)
@@ -50,11 +50,12 @@ except ImportError:
             return np.broadcast_to(self, other.shape).view(Tensor)
 
     def tensor(value, **kwargs):
+        kwargs.pop("device", None)
         return np.array(value, **kwargs).view(Tensor)
 
     torch = SimpleNamespace(
         Tensor=Tensor, tensor=tensor, pi=math.pi, long=np.int64, bool=bool,
-        zeros=lambda *shape, device=None: np.zeros(shape).view(Tensor),
+        zeros=lambda *shape, device=None, dtype=None: np.zeros(shape, dtype=dtype).view(Tensor),
         full=lambda shape, value, device=None, dtype=None: np.full(shape, value, dtype=dtype).view(Tensor),
         ones_like=lambda value, dtype=None: np.ones_like(value, dtype=dtype),
         zeros_like=np.zeros_like, maximum=np.maximum, where=np.where, isfinite=np.isfinite,
@@ -242,6 +243,22 @@ class DogW1GaitTest(unittest.TestCase):
         self.assertClose(reward(self.env, self.asset, **kwargs), [0., 0.])
         self.assertClose(reward(self.env, self.asset, **kwargs, turn_height_bonus=.02), [0., .02**2])
 
+    def test_standing_recovery_terms_stop_penalizing_after_motion_command(self):
+        data = self.env.scene["robot"].data
+        data.joint_pos = torch.tensor([[.2]*4, [.2]*4])
+        data.default_joint_pos = torch.zeros(2, 4)
+        data.joint_vel = torch.tensor([[.5]*4, [.5]*4])
+        data.root_lin_vel_b = torch.tensor([[.2, 0., 0.], [.2, 0., 0.]])
+        data.root_ang_vel_b = torch.tensor([[0., .3, 0.], [0., .3, 0.]])
+        self.asset.joint_ids = [0, 1, 2, 3]
+        self.env.command[:] = 0.
+        for name, expected in (("standing_posture", .04), ("standing_joint_velocity", .25),
+                               ("standing_base_velocity", .13)):
+            self.assertClose(self.ns[name](self.env, "base_velocity", self.asset), [expected]*2)
+        self.env.command[:, 2] = .2
+        for name in ("standing_posture", "standing_joint_velocity", "standing_base_velocity"):
+            self.assertClose(self.ns[name](self.env, "base_velocity", self.asset), [0., 0.])
+
     def test_invalid_terrain_rays_are_masked(self):
         terrain = SimpleNamespace(name="height_scanner_base")
         self.env.scene.sensors[terrain.name] = SimpleNamespace(cfg=SimpleNamespace(mesh_prim_paths=["ground"]))
@@ -271,7 +288,7 @@ class DogW1GaitTest(unittest.TestCase):
                          and n.name in (f"{terrain}_configure_task_reward_values", f"{terrain}_configure_rewards",
                                         f"{terrain}_configure_dog_w1_phase_swing_reward")]
             term_names = {n.attr for function in functions for n in ast.walk(function)
-                          if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "cfg.rewards"}
+                          if isinstance(n, ast.Attribute) and ast.unparse(n.value) in ("cfg.rewards", "rewards")}
             term_names.update(("feet_air_time", "feet_air_time_variance", "feet_gait", "feet_height", "feet_height_body"))
             rewards = SimpleNamespace(**{
                 name: SimpleNamespace(weight=0., params={
@@ -288,11 +305,21 @@ class DogW1GaitTest(unittest.TestCase):
             ns[f"{terrain}_configure_rewards"](cfg)
             self.assertIs(rewards.feet_contact.func, self.ns["PhaseContactReward"])
             self.assertGreater(rewards.feet_contact.weight, 0.)
-            self.assertEqual(rewards.feet_contact.params.get("centered", False), terrain == "flat")
+            if terrain == "flat":
+                self.assertTrue(rewards.feet_contact.params["centered"])
             if terrain == "flat":
                 self.assertLess(rewards.lateral_velocity_error.weight, 0.)
-                self.assertEqual(rewards.phase_swing_clearance.params["foot_radius"], .08)
-                self.assertEqual(rewards.upward.weight, 0.)
+                distance = rewards.feet_distance_y_exp
+                self.assertEqual(distance.params["stance_width"], .44)
+                self.assertEqual(distance.params["asset_cfg"].body_names, self.ns["FOOT_ORDER"])
+                self.assertTrue(distance.params["asset_cfg"].preserve_order)
+                self.assertEqual(rewards.standing_base_velocity.weight, -2.)
+                self.assertEqual(rewards.standing_posture.weight, -5.)
+
+                self.assertEqual(rewards.feet_slide.params["wheel_radius"],
+                                 rewards.phase_swing_clearance.params["foot_radius"])
+                self.assertIs(rewards.feet_slide.func, self.ns["wheel_ground_slip"])
+                self.assertIs(rewards.wheel_vel_zero_cmd_l2.func, self.ns["stationary_wheel_velocity"])
                 self.assertEqual(rewards.wheel_vel_variance.weight, 0.)
 
             self.assertIs(rewards.feet_contact_without_cmd.func, self.ns["standing_contact"])

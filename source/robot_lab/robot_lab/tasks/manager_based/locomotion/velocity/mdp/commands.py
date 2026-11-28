@@ -51,6 +51,14 @@ class UniformThresholdVelocityCommand(mdp.UniformVelocityCommand):
             direction_error[valid_mask] = torch.abs(torch.atan2(torch.sin(heading_delta), torch.cos(heading_delta)))
         self.metrics["error_vel_dir"] += direction_error / max_command_step
 
+    def _update_command(self):
+        super()._update_command()
+        # With heading_command=True the base class keeps writing a yaw command from the
+        # heading error. When the linear command is zeroed by the threshold, that yaw
+        # command must be zeroed too, otherwise "stand still" still asks the robot to turn.
+        stationary = torch.linalg.norm(self.vel_command_b[:, :2], dim=1) <= 0.2
+        self.vel_command_b[stationary, 2] = 0.0
+
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
         # set small commands to zero

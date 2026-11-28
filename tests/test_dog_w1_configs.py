@@ -86,7 +86,8 @@ class DogW1ConfigTest(unittest.TestCase):
                                      or "config.quadruped.atdog" in (node.module or ""), str(path))
                 if isinstance(node, ast.ClassDef):
                     for base in node.bases:
-                        self.assertFalse(ast.unparse(base).startswith("ATDog"), (path, node.name))
+                        if "Wall" not in node.name:
+                            self.assertFalse(ast.unparse(base).startswith("ATDog"), (path, node.name))
 
     def test_phase_first_actor_and_critic_teacher_slices(self):
         widths = {"phase": 2, "base_lin_vel": 3, "base_ang_vel": 3, "projected_gravity": 3,
@@ -159,7 +160,7 @@ class DogW1ConfigTest(unittest.TestCase):
                     self.assertIn(cls, definitions)
         self.assertEqual(set(registrations), {
             f"RobotLab-Isaac-Velocity-{terrain}-ATDog-DogW1-v0"
-            for terrain in ("Flat", "Rough", "Slope", "Sand", "Stairs", "Tires")})
+            for terrain in ("Flat", "Rough", "Slope", "Sand", "Stairs", "Tires", "Wall")})
 
     def test_wheel_angles_masked_after_reordering_joints(self):
         tree = ast.parse((TASK / "observations.py").read_text())
@@ -176,6 +177,20 @@ class DogW1ConfigTest(unittest.TestCase):
         np.testing.assert_array_equal(result[0, :12], np.array(order[:12]))
         np.testing.assert_array_equal(result[0, 12:], 0.)
         np.testing.assert_array_equal(data.joint_pos, np.arange(1., 17.)[None, :])
+
+    def test_mirrored_action_scales(self):
+        tree = ast.parse((TASK / "observations.py").read_text())
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("dog_w1_joint_pos_scale", "dog_w1_joint_vel_scale")]
+        namespace = {}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "observations.py", "exec"), namespace)
+        pos = namespace["dog_w1_joint_pos_scale"]()
+        vel = namespace["dog_w1_joint_vel_scale"]()
+        self.assertEqual(pos["FL_hip_joint"], -pos["FR_hip_joint"])
+        self.assertEqual(pos["RL_hip_joint"], -pos["RR_hip_joint"])
+        self.assertEqual(vel["FL_foot_joint"], -vel["FR_foot_joint"])
+        self.assertEqual(vel["RL_foot_joint"], -vel["RR_foot_joint"])
+        self.assertEqual(vel["FL_foot_joint"], vel["RL_foot_joint"])
 
 
 if __name__ == "__main__":

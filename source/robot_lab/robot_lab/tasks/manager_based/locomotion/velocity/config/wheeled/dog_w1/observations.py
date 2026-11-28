@@ -12,3 +12,31 @@ def joint_pos_rel_without_wheel(env, asset_cfg, wheel_asset_cfg):
     wheel_columns = [asset_cfg.joint_ids.index(joint_id) for joint_id in wheel_asset_cfg.joint_ids]
     joint_pos[:, wheel_columns] = 0.0
     return joint_pos
+
+
+def dog_w1_joint_pos_scale():
+    """Mirror hip abduction across left/right using the URDF joint axes."""
+    return {
+        "FL_hip_joint": 0.125,
+        "FR_hip_joint": -0.125,
+        "RL_hip_joint": -0.125,
+        "RR_hip_joint": 0.125,
+        "FL_thigh_joint": 0.25,
+        "FR_thigh_joint": 0.25,
+        "RL_thigh_joint": 0.25,
+        "RR_thigh_joint": 0.25,
+        "FL_calf_joint": 0.25,
+        "FR_calf_joint": 0.25,
+        "RL_calf_joint": 0.25,
+        "RR_calf_joint": 0.25,
+    }
+
+
+def dog_w1_joint_vel_scale():
+    """Make a positive wheel action drive every wheel toward body +x."""
+    return {
+        "FL_foot_joint": 5.0,
+        "FR_foot_joint": -5.0,
+        "RL_foot_joint": 5.0,
+        "RR_foot_joint": -5.0,
+    }

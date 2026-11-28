@@ -180,3 +180,11 @@ class ATDogDogW1TiresPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class ATDogDogW1WallPPORunnerCfg(ATDogDogW1FlatPPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "atdog_dog_w1_wall"
+        self.max_iterations = 10000

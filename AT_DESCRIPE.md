@@ -821,3 +821,131 @@ joint_acc 惩罚约 −38.45，明显大于五项楼梯惩罚。
 当前进程不热更新，改动下次新启动/resume 生效；未打断现有训练。
 不以改权重后的总奖励判断改善；需固定高度验证成功率和摔倒率。
 详见 `docs/ATDOG2_REWARD_HIM_AUDIT.md` 的本次快照与调整记录。
+
+
+## DogW1 Flat：轮胎滑移与停车制动修正（2026-11-26）
+
+本次仅调整 DogW1 Flat，保留其他任务及用户已有的动作符号、奖励权重修改。
+
+- `feet_slide` 改用本地 `wheel_ground_slip`：在水平静止地面假设下，接触点速度为 `v_com + ω_body × (p_wheel_center - p_com - radius*world_Z)`。使用轮刚体完整世界角速度，包含轮子自转；按当前接触时间门控，惩罚地面切向速度。相同机身平移不再抵消真实滑移；左右轮符号无需手工填写。该近似用于 Flat 水平面，不用于坡面法向或移动地面。半径同步读取本任务 `phase_swing_clearance.params["foot_radius"]`。
+- Flat 使用本地 `DogW1VelocityCommand`，保留原地转向与 heading 控制，静止采样由上游 `is_standing_env` 处理，不再根据线速度大小无条件清零 yaw。未修改共享命令类，其他任务行为保持。
+- `wheel_vel_zero_cmd_l2` 改用本地 `stationary_wheel_velocity`，与相位和制动共同使用平移模长0.05、yaw绝对值0.05门限；两者均低于门限才静止，纯转向不锁轮。
+- Flat 轮动作改为 `DogW1WheelVelocityActionCfg`：每个物理步静止时强制速度目标为零，首次停车捕获轮角，使用Kp=20、Kd=2、最大附加力矩15 Nm的位置保持制动；运动时清除制动力矩、恢复策略速度目标，reset后重新捕获角度。PhysX原速度驱动和电机总限幅仍在，这是有限力矩伺服制动，不能保证任意外力下绝对零位移。
+- 制动目标与原始网络动作不同，观测中的last action仍表示网络输出；部署端必须实现相同的停车门控和制动，否则导出网络本身不包含这些控制逻辑。新建环境后生效，建议用新目录训练，旧策略的控制行为会随新动作层变化。
+
+回归覆盖正确滚动/空转/滑动、轮COM偏移、停车角捕获和保持、限矩、解除制动/重新停车、纯yaw放行。当前环境缺少Isaac Lab/PyTorch，数值检查使用NumPy适配器，尚未完成真实仿真制动与接触验证。
+
+
+## DogW1 Flat 支撑间距与抗扰恢复（2026-11-26）
+
+参考 Dog2 Flat 的 `feet_distance_y_exp`（+20、width=0.18、std=0.18，选 calf 原点）及静止稳定项；DogW1 使用实际轮心 FL/FR/RL/RR，`preserve_order=True`，机身系 Y 目标±0.22 m，即 `stance_width=0.44`、`std=0.18`、权重+20。width表示左右总宽度。不能直接把Dog2 calf原点0.18 m目标用于DogW1轮心；此奖励约束各轮相对机身的Y位置，并非仅两轮距离。
+
+Flat增加Dog2式静止稳定项：腿速均方−0.5、腿部相对默认角度均方−5、机身线/角速度平方和−2。关闭旧stand_still的强L1姿态项，移动时joint_pos_penalty从−10减为−2，允许受扰后调整支撑；roll/pitch角速度从−3改为−6。保留高度、倾斜、停车制动等现有设置。默认姿态回归并不等同于回正，腿角不能被强约束到无法纠偏。
+
+参考Dog2 FlatDomainRand的15～20 s推搡间隔，在DogW1 Flat加入±0.2 m/s的xy速度扰动（Dog2为±0.5），静止采样比例提高到15%。这是恢复训练样本，不保证任何外力下都能站稳；超过倾倒终止阈值仍会重置。先验证小扰动恢复，再增加力度。没有修改执行器PD或硬件增益。
+
+只变更Flat训练奖励和扰动，不改变59/354维观测、16维动作或导出策略解析；部署性能需重新训练并回放验证。部署若未同步现有停车制动、关节符号和控制增益，仍可能影响实际平衡，不能仅靠本次奖励修改解决。数值/配置检查通过，尚未运行Isaac仿真推搡实验。
+
+
+## DogW1 外力及外力矩扰动更新（2026-11-26）
+
+DogW1 各任务继承通用 `randomize_apply_external_force_torque` reset 事件，作用刚体为 `base`。Flat 移除原先±2的覆盖，与通用配置及Dog2一致：xyz各轴力分别均匀采样−10～10 N，xyz各轴力矩分别均匀采样−10～10 Nm。reset时重新采样，在当前Isaac Lab实现中写入持久外力缓冲，之后物理步持续施加直到清除/重置；不是短脉冲。定时速度推搡仍是独立事件，Flat保持15～20秒、xy各±0.2 m/s。此节覆盖前文Flat外力±2的旧说明；新建环境生效。
+
+
+## DogW1 Wall：30 cm 垂直墙攀越（2026-11-26）
+
+`himloco` 分支新增 `dog_w1/wall_env_cfg.py`，继承当前 `ATDogDogW1FlatEnvCfg`，Flat保持原配置。每个环境实例在局部 `(1.0,0,height/2)` 放置带刚性碰撞的运动学Cuboid，厚0.08 m、横向长1.8 m。不是视觉网格，也不改通用地形生成器。环境间距5 m，越墙通道半宽0.55 m，禁止绕行；超过局部x范围−0.5～2.5 m也终止。
+
+只注册一个任务：`RobotLab-Isaac-Velocity-Wall-ATDog-DogW1-v0`，PPO、HIM、CUSRL 均可使用。墙体参数集中在 `wall_env_cfg.py::ATDogDogW1WallEnvCfg` 顶部：
+
+```python
+wall_height = 0.30     # 墙高，m
+wall_thickness = 0.08  # 前进方向厚度，m
+wall_length = 1.8      # 横向长度，m
+wall_x = 1.0          # 墙体中心 X，m
+```
+
+需要低墙训练时直接修改 `wall_height`，再重新创建环境。墙体几何、中心高度和奖励中的墙高参数会同步读取该值；不提供多个高度任务。运行中的墙体不会因编辑文件而即时改变。HIM实验目录为`atdog_dog_w1_wall_him`，PPO/CUSRL为`atdog_dog_w1_wall`，默认10000次迭代。
+
+### 策略接口和环境配置
+
+第一版是**固定墙、本体感知输入**实验：actor59维单帧、HIM6帧354维、critic62维、16动作，网络与Flat一致，未加入真实墙距/高度或足端高度观测，部署输入格式不变。HIM估计器仍使用57维teacher目标。可从Flat checkpoint初始化；继承的是本地Flat配置，未切换分支或修改已有checkpoint。该版本对墙距、尺寸的泛化没有保证。
+
+每回合12 s，固定朝世界+X：vx范围0.25～0.4 m/s、vy=0、heading=0，yaw纠偏限制±0.4 rad/s；初始位置xy±2 cm、姿态±0.03 rad。关闭持久外力/力矩、定时速度推搡和质心随机化，其他继承的动力学随机化保持，先验证基本攀越。
+
+Wall关闭固定机身高度奖励、原Flat地面相位间隙和水平地面滑移奖励，避免踩上墙顶时被错误惩罚；减轻水平姿态、竖直速度和关节默认姿态约束，保留非轮接触惩罚和base触地终止。倾倒阈值放宽到1.4 rad。相位观测和相位接触项保留，权重降到3，允许攀越时暂时偏离trot。
+
+### 专有奖励与完成判定
+
+实现位于`dog_w1/wall_rewards.py`，所有位置先减去环境原点：
+
+- `wall_task`：以基座x的历史最高值计进度（3倍距离增量），后退再前进不会刷重复进度；在通道内且有效范围内才奖励。成功发放一次+10，进度与成功按`1/dt`换算，避免Isaac Lab积分把一次性奖励缩小。
+- `wall_foot_clearance`：仅轮心靠近墙前后表面±0.12 m范围时，对低于“墙高+轮半径+0.03 m”的高度亏欠平方扣分，权重−80。不是无上限奖励高抬腿。Wall的foot_radius默认0.0765 m，可在独立文件调整。
+- `wall_base_clearance`：基座靠近墙x±0.28 m时，对机身高度低于墙高+0.08 m的亏欠平方扣分，权重−50。
+- `wall_success`：基座越过墙后表面0.35 m、四轮均越过后表面0.08 m、未绕出墙长范围、轮心已回到地面附近（z<0.18 m）、机身朝上投影>0.94、角速度<0.6 rad/s、线速度<0.8 m/s、机身高0.22～0.55 m，并连续保持0.3 s。成功后按time_out截断，不触发失败罚；`Episode_Termination/wall_success`可监控成功比例。只基座越墙或空中飞越不算稳定完成。
+
+全局非足端接触项会同时惩罚地面及墙体接触，没有把任意接触力冒充“只碰墙”的传感器读数。没有新增actor墙体感知，也没有自动升墙课程：由用户在同一个配置中调整高度并重新启动训练。
+
+### 训练命令
+
+先进入仓库；以下启动器为本文容器路径。将checkpoint占位路径替换为实际模型：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+  --task=RobotLab-Isaac-Velocity-Wall-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --him_init_checkpoint=logs/rsl_rl/atdog_dog_w1_flat_him/实际运行目录/model_5000.pt \
+  --num_envs=1024 --headless
+```
+
+逐步训练时，在同一配置中修改`wall_height`，并用上一高度checkpoint作为`--him_init_checkpoint`。该参数只初始化权重，不恢复旧优化器和迭代状态；不要同时使用`--resume`。先以64～256环境调试碰撞和奖励，再扩大并行数。每个高度使用独立日志目录。
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py \
+  --task=RobotLab-Isaac-Velocity-Wall-ATDog-DogW1-v0 \
+  --agent=rsl_rl_him_cfg_entry_point \
+  --checkpoint=实际Wall模型路径 --num_envs=1
+```
+
+play沿用HIM导出机制；部署必须保留现有相位、关节符号和停车制动语义。固定墙训练不能直接等同于实机具备未知墙体攀越能力。
+
+### 验证
+
+无仿真回归：`python3 -m unittest discover -s tests -p 'test_dog_w1*.py' -v`。真实仿真检查：
+
+```bash
+/workspace/isaaclab/isaaclab.sh -p tests/check_dog_w1_wall_sim.py --headless
+```
+
+后者加载当前Wall配置、验证HIM维度，并运行4个环境20控制步检查有限奖励。当前编辑环境缺少Isaac Lab/PyTorch，尚未执行真实仿真、训练或翻越效果验证；30 cm攀越的机械可行性、接触稳定性和权重需要实际训练评估。后续可单独增加显式墙体观测任务，届时需处理新增输入与Flat权重的兼容，不能直接给旧模型追加输入。
+
+
+### Wall 奖励参数集中配置
+
+Wall 全部奖励配方位于 `dog_w1/wall_env_cfg.py`：`wall_configure_task_reward_values()` 设置基础项权重与参数；`wall_configure_dog_w1_phase_swing_reward()` 设置相位参数（Wall 默认关闭地面间隙项）；`wall_configure_rewards()` 组装接触、稳定和翻墙专有奖励。Wall 在继承场景/动作后重新创建奖励配置，因此 Flat 后续奖励调参不会隐式改变 Wall。
+
+翻墙进度系数、一次性成功奖金、越墙余量、落地高度/姿态/速度门限、稳定持续时间，以及轮足/机身间隙的检测窗口和安全余量均显式放在本文件的 `RewTerm.params` 中。`wall_rewards.py` 仅保留计算逻辑，数值参数从配置传入；终止通道边界也在 `wall_env_cfg.py` 的 `DoneTerm.params` 中设置。
+
+
+### Wall 接触触发越障响应（2026-11-26）
+
+Wall 新增 `wall_response.py` 的 `WallContactState`，全部可调门限与权重仍集中于 `wall_env_cfg.py::wall_configure_rewards()`。Actor/critic 输入维度不变；训练端的触发状态来自过滤物理接触，不是仅凭距离。当前策略仍属无显式墙体观测的本体感知实验，状态机不会直接修改动作。
+
+每个前腿 thigh/calf/foot 和机身base分别建立独立ContactSensor，只过滤`{ENV_REGEX_NS}/Wall`；四个轮子也各有墙体过滤传感器。每个传感器只挂一个刚体，符合Isaac Lab one-to-many过滤限制。地面接触不会触发；读不到force_matrix_w时直接报错，不静默回退成任意接触。
+
+状态：0接近→1前腿响应→2后腿响应→3恢复；4为失败。前腿或base过滤力合计大于5 N触发并锁存，离墙后不会立即关闭。前轮需越过墙后表面且轮底高于墙顶3 cm，逐轮锁存后切换到后腿；四轮及机身越墙后关闭动作响应，进入恢复，最终仍需原wall_success稳定落地判定。触发6 s内未完成则终止；机身持续顶墙超过0.5 s也终止。Wall不再首次base触墙立即终止，以免接触触发尚未响应就重置；保留倾倒终止、非轮接触惩罚和明确顶墙失败条件。
+
+| 日志奖励项 | 权重 | 约束 |
+| --- | ---: | --- |
+| wall_response_hip | +1 | 当前阶段腿外摆目标0.15 rad、sigma0.12；靠墙且实际创造向前进度才奖励 |
+| wall_response_lift | +3 | 当前阶段腿、靠墙、摆动相且实际未接触；轮心目标=墙高+轮半径+3 cm，sigma0.06；必须伴随轮心或机身新的前向进度 |
+| wall_response_wheel | +1 | 接触、靠墙、机身确实推进；世界+X等效滚动速度目标0.4 m/s，sigma0.2，不按四轮原始关节速度同号比较 |
+| wall_response_progress | +3 | 只奖励响应阶段机身x历史新高的增量，不奖励往返刷进度 |
+| wall_response_clear | +4 | 每个轮子首次越过后表面且轮底高于墙顶余量发放一次，按1/dt还原离散奖金 |
+| wall_response_slip | −1 | 接地点切向速度：墙接触使用墙过滤法向，地面接触使用世界Z；包括轮角速度和COM偏移 |
+| wall_response_collision | −0.1 | base过滤墙接触超阈力，单步力截断50 N；持续顶墙另有终止 |
+| wall_response_recovery | +2 | 全部越墙后鼓励机身朝上及小角速度，持续到稳定成功终止 |
+
+髋关节外摆符号按FL/FR/RL/RR为`[+1,-1,-1,+1]`，相对默认角度计算；轮驱动使用实际世界角速度Y乘轮半径，因此自动包含左右镜像。上述有界奖励不直接鼓励“外摆越大/轮速越高越好”。抬轮窗口使用相位与实际接触双门控；完全不前进时不会靠髋外摆/高速空转获得动作奖励。新进度与首次足端跨墙使用单步缓存，重复读取不会再次推进状态，局部reset独立清零。
+
+滑移项采用单接触法向近似；同时接触墙和地面时优先使用过滤墙法向，不等同于完整多接触力学重建。真实传感器接线、碰撞及攀越效果仍需在Isaac Lab运行`tests/check_dog_w1_wall_sim.py`验证。数值回归覆盖接触锁存、地面不触发、前后腿切换、跨墙一次奖励、超时、持续顶墙、外摆有界性、无进度无驱动奖励、不同表面法向滑移及局部reset。
